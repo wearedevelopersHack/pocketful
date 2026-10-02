@@ -1,0 +1,34 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pocketful runtime database (default POCKETFUL_DB, api/__main__.py)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Gate / self-check fixtures (api/selfcheck.py writes under TMPDIR;
+# ops/backup_db.py writes timestamped backups)
+selfcheck.db
+*.db.bak
+pocketful-*.db
+
+# Secrets and environment (never committed — see roles/deploy-engineer.md §5)
+.env
+.env.*
+*.pem
+*.key
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

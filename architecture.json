@@ -1,0 +1,84 @@
+{
+  "kind": "layered",
+  "title": "Pocketful — money path",
+  "layers": [
+    {
+      "id": "edge",
+      "title": "Edge (public)",
+      "items": [
+        { "id": "edge_nginx", "label": "nginx vhost pocketful.getn.space", "details": "TLS terminator. Proxies ONLY to the wallet process; the API port is not in the vhost. The existing [::]:443 block already owns ipv6only=on — this block inherits and must omit it." },
+        { "id": "edge_browser", "label": "Browser (a view, never a key holder)", "details": "Generates no idempotency key, stores none, sends none. No hidden field, cookie or URL param carries one." }
+      ]
+    },
+    {
+      "id": "client",
+      "title": "Client (app/)",
+      "items": [
+        { "id": "app_web", "label": "Wallet web server (app/web.py)", "details": "stdlib http.server, loopback-fronted. GET / , POST /send -> 303 See Other (PRG), POST /retry, GET /health. Mints and persists the key in Python. Rendering never writes." },
+        { "id": "client_ui", "label": "Wallet UI: balance + activity feed", "details": "Reads server truth only. Never sums a local list to compute a balance." },
+        { "id": "client_send_flow", "label": "Send flow: key generation + persistence", "details": "One key per user press, persisted before the first attempt, reused on every retry including after restart." },
+        { "id": "client_api_layer", "label": "API client (integer minor units only)", "details": "No parseFloat, no toFixed on a sent amount. Display formatting happens at the edge." },
+        { "id": "client_store", "label": "Key store (app/keystore.py)", "details": "Holds PENDING keys. Durability-critical: same ext4 root volume as the DB, never /tmp or network storage. A lost store is a fresh key on retry = double-spend." }
+      ]
+    },
+    {
+      "id": "api",
+      "title": "API (api/) — loopback only, never public",
+      "items": [
+        { "id": "api_routes", "label": "HTTP routes", "details": "POST /accounts, GET /accounts/{id}/balance, POST /transfers, GET /accounts/{id}/activity" },
+        { "id": "api_validation", "label": "Request validation", "details": "Reject, do not coerce. Non-integer / bool / zero / negative / out-of-range amounts are 400/422." },
+        { "id": "api_idempotency", "label": "Idempotency-Key header handling", "details": "Key is read from the header; replay returns the stored response; same key + different body is 409." }
+      ]
+    },
+    {
+      "id": "ledger",
+      "title": "Ledger core (ledger/)",
+      "items": [
+        { "id": "ledger_core", "label": "Ledger operations", "details": "open_account, get_balance, transfer, split — the only writers of money." },
+        { "id": "ledger_entries", "label": "Double-entry writer", "details": "Every mutation writes entries summing to zero. No balance is mutated without a paired entry." },
+        { "id": "ledger_idem_store", "label": "Idempotency store", "details": "Key + fingerprint + result written in the same transaction that applies the transfer." },
+        { "id": "ledger_split", "label": "Deterministic split", "details": "Parts sum exactly to the total; remainder distributed by a documented policy, never truncated away." }
+      ]
+    },
+    {
+      "id": "data",
+      "title": "Storage (SQLite)",
+      "items": [
+        { "id": "db_accounts", "label": "accounts", "details": "account_id, owner_id, currency, allow_overdraft, version, created_at" },
+        { "id": "db_ledger_entries", "label": "ledger_entries", "details": "Signed INTEGER amount_minor. Balances are a derived view; no cached balance column in v1." },
+        { "id": "db_idempotency_keys", "label": "idempotency_keys", "details": "key PRIMARY KEY, request_fingerprint, transfer_id, response_json — the uniqueness that makes replay safe." }
+      ]
+    },
+    {
+      "id": "gate",
+      "title": "Evidence (tests/)",
+      "items": [
+        { "id": "gate_invariants", "label": "I1–I6 assertions", "details": "Reusable functions every scenario calls." },
+        { "id": "gate_harness", "label": "Concurrency harness", "details": "Parallel transfer storm, 100x same-key retry storm, failure atomicity, fuzz." },
+        { "id": "gate_runner", "label": "Gate command", "details": "One command runs tests + build + lint; its quoted output is the only accepted proof of done." }
+      ]
+    }
+  ],
+  "flows": [
+    { "from": "edge_browser", "to": "edge_nginx", "label": "HTTPS" },
+    { "from": "edge_nginx", "to": "app_web", "label": "proxy to the wallet only" },
+    { "from": "app_web", "to": "client_ui", "label": "renders the view" },
+    { "from": "app_web", "to": "client_send_flow", "label": "mints the key in Python" },
+    { "from": "client_send_flow", "to": "client_store", "label": "persist BEFORE first attempt" },
+    { "from": "client_ui", "to": "client_api_layer", "label": "user intent" },
+    { "from": "client_send_flow", "to": "client_api_layer", "label": "key + body, persisted first" },
+    { "from": "client_api_layer", "to": "api_idempotency", "label": "POST /transfers + Idempotency-Key" },
+    { "from": "client_api_layer", "to": "api_routes", "label": "JSON, integer minor units" },
+    { "from": "api_routes", "to": "api_validation", "label": "raw body" },
+    { "from": "api_validation", "to": "ledger_core", "label": "validated int amount" },
+    { "from": "api_idempotency", "to": "ledger_idem_store", "label": "key + request fingerprint" },
+    { "from": "ledger_core", "to": "ledger_split", "label": "split(total, n)" },
+    { "from": "ledger_core", "to": "ledger_entries", "label": "balanced entry pair" },
+    { "from": "ledger_entries", "to": "db_ledger_entries", "label": "INSERT, signed INTEGER" },
+    { "from": "ledger_idem_store", "to": "db_idempotency_keys", "label": "INSERT in same txn" },
+    { "from": "ledger_core", "to": "db_accounts", "label": "existence, currency, version" },
+    { "from": "db_ledger_entries", "to": "gate_invariants", "label": "SUM(amount) == 0" },
+    { "from": "gate_harness", "to": "ledger_core", "label": "N concurrent transfers" },
+    { "from": "gate_runner", "to": "gate_harness", "label": "runs the suite" }
+  ]
+}
