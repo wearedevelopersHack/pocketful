@@ -105,7 +105,8 @@ fi
 SECRET_HITS="$(
     git diff --cached -U0 -- . \
     | grep -aEo 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|BEGIN [A-Z ]*PRIVATE KEY|ANTHROPIC_AUTH_TOKEN[[:space:]]*=|AWS_SECRET_ACCESS_KEY[[:space:]]*=' \
-    | sort -u | cut -c1-32 || true
+    | sed -E 's/^(github_pat_|ghp_|gho_|sk-ant-|sk-|AKIA|xox[baprs]-).*/\1/' \
+    | sort -u || true
 )"
 
 if [ -n "$SECRET_HITS" ]; then
