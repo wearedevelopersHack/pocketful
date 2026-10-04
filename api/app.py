@@ -13,12 +13,17 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from ledger import AccountExists, Ledger, connect
+from ledger import (
+    OPENING_GRANT_MINOR,
+    SYSTEM_ACCOUNT_CURRENCY,
+    AccountExists,
+    Ledger,
+    connect,
+)
 from ledger.types import Account, ActivityItem, LedgerError, TransferResult
 
 from . import errors, validation
@@ -150,6 +155,10 @@ def activity_to_wire(item: ActivityItem) -> dict:
         "amount_minor": abs(int(item.amount_minor)),
         "balance_after_minor": int(item.balance_after_minor),
         "counterparty_account_id": item.counterparty_account_id,
+        # §C2.5: the counterparty's owner, beside its id and never instead of it.
+        # ``list_activity`` resolves it in the same read; this boundary only
+        # projects it, so the client never has to turn an id into a name itself.
+        "counterparty_owner_id": item.counterparty_owner_id,
         "created_at": item.created_at,
     }
 
@@ -278,7 +287,21 @@ class PocketfulHandler(BaseHTTPRequestHandler):
         owner_id = validation.require_non_empty_str(raw, "owner_id")
         currency = validation.require_currency(raw)
         allow_overdraft = validation.require_bool(raw, "allow_overdraft", False)
-        account_id = validation.optional_account_id(raw) or uuid.uuid4().hex
+        # §C2.1: required and client-supplied — the server never mints one. The
+        # caller's id is what makes the ledger's accounts PRIMARY KEY the
+        # exactly-once guard (§C1.5), so a retry earns a 409 rather than a
+        # second account carrying a second $100.
+        account_id = validation.require_account_id(raw)
+
+        # §C2.3 and the currency ruling that goes with it. The grant is the
+        # API's POLICY (the ledger's own default is 0, §C1.6) and it is USD-only
+        # because the system account it posts against is single-currency
+        # (§C1.2) and INVARIANTS §1 forbids cross-currency arithmetic without a
+        # recorded rate. A non-USD account still opens — ungranted, at 0. What
+        # is restricted is the grant, not the generality of creation.
+        opening_grant_minor = (
+            OPENING_GRANT_MINOR if currency == SYSTEM_ACCOUNT_CURRENCY else 0
+        )
 
         try:
             account = self.server.pool.ledger().open_account(
@@ -286,16 +309,28 @@ class PocketfulHandler(BaseHTTPRequestHandler):
                 owner_id=owner_id,
                 currency=currency,
                 allow_overdraft=allow_overdraft,
+                opening_grant_minor=opening_grant_minor,
             )
         except AccountExists as exc:
-            # Reject; never hand back the existing account (§2.1: deliberately
-            # not idempotent). Any other LedgerError is unexpected and falls
-            # through to the generic 500 rather than being mislabelled a 409.
+            # Reject; never hand back the existing account (§2.1, §C2.4:
+            # deliberately not idempotent). The duplicate fails on the first
+            # INSERT, before the transfer or any entry is touched, so the
+            # refusal posts no second grant.
             raise errors.account_exists_error(exc) from exc
+        except LedgerError as exc:
+            # §C1.7: a reserved id is refused by the ledger and MUST reach the
+            # client as a 4xx. Falling through to the generic 500 would report a
+            # policy refusal as a crash and let a client tell the two apart.
+            raise errors.from_ledger_error(exc) from exc
 
-        LOG.info("account opened: %s", account.account_id)
-        # A brand-new account has no entries, so its derived balance is exactly 0.
-        return 201, account_to_wire(account, balance_minor=0), None
+        LOG.info("account opened: %s (grant %s minor)", account.account_id,
+                 opening_grant_minor)
+        # A brand-new account's only entry is the grant posted in the same
+        # transaction (§C1.4), so its derived balance is exactly that grant:
+        # 10000 for a granted USD account, 0 for an ungranted one. This reports
+        # the value the ledger actually posted rather than a hard-coded 0, so it
+        # stays honest when the policy changes.
+        return 201, account_to_wire(account, balance_minor=opening_grant_minor), None
 
     def _get_balance(self, account_id: str) -> tuple[int, dict, None]:
         try:
@@ -310,6 +345,9 @@ class PocketfulHandler(BaseHTTPRequestHandler):
             raise errors.from_ledger_error(exc) from exc
         return 200, {
             "account_id": account.account_id,
+            # §C2.5: the owner rides the read path, so the client prints the
+            # name it is given instead of holding an id→name map of its own.
+            "owner_id": account.owner_id,
             "currency": account.currency,
             "balance_minor": balance_minor,
         }, None

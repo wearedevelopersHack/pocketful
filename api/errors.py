@@ -28,6 +28,8 @@ silently ignoring a bad query or an unknown route would be a form of coercion):
 * ``payload_too_large`` (413) — body over the read limit.
 * ``not_found`` (404) — no route matches.
 * ``method_not_allowed`` (405) — route exists, method does not.
+* ``system_account_transfer`` (422, §C1.8) — a transfer named the system account.
+* ``reserved_account_id`` (409, §C1.7) — the id is the reserved system account's.
 * ``internal_error`` (500) — an unexpected failure; the traceback is logged.
 """
 
@@ -39,7 +41,9 @@ from ledger import (
     InsufficientFunds,
     InvalidAmount,
     LedgerError,
+    ReservedAccountId,
     SameAccountTransfer,
+    SystemAccountTransfer,
     UnknownAccount,
 )
 
@@ -57,6 +61,8 @@ INVALID_AMOUNT = "invalid_amount"
 CURRENCY_MISMATCH = "currency_mismatch"
 INSUFFICIENT_FUNDS = "insufficient_funds"
 SAME_ACCOUNT_TRANSFER = "same_account_transfer"
+SYSTEM_ACCOUNT_TRANSFER = "system_account_transfer"
+RESERVED_ACCOUNT_ID = "reserved_account_id"
 INTERNAL_ERROR = "internal_error"
 PAYLOAD_TOO_LARGE = "payload_too_large"
 
@@ -67,6 +73,17 @@ LEDGER_REFUSALS: tuple[tuple[type[LedgerError], int, str], ...] = (
     (UnknownAccount, 404, UNKNOWN_ACCOUNT),
     (CurrencyMismatch, 422, CURRENCY_MISMATCH),
     (SameAccountTransfer, 422, SAME_ACCOUNT_TRANSFER),
+    # §C1.8: the system account funds opening grants and nothing else. Its
+    # ``allow_overdraft`` means a transfer touching it would be a mint of any
+    # amount, so the refusal is a property of the request's CONTENT — the same
+    # class as ``same_account_transfer``, hence the same 422. Named explicitly:
+    # a catch-all here would answer 500 for a policy refusal and let a client
+    # tell a refusal from a crash.
+    (SystemAccountTransfer, 422, SYSTEM_ACCOUNT_TRANSFER),
+    # §C1.7: the id names the reserved system account. 409 for the same reason
+    # ``account_exists`` is 409 — the id is already spoken for and can never
+    # become the caller's, which is a conflict rather than a malformed request.
+    (ReservedAccountId, 409, RESERVED_ACCOUNT_ID),
     (InsufficientFunds, 422, INSUFFICIENT_FUNDS),
     (IdempotencyConflict, 409, IDEMPOTENCY_CONFLICT),
 )

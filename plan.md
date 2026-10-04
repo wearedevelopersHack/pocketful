@@ -3507,3 +3507,363 @@ rather than omissions:**
   and teaches the wrong gesture. The id stays visible and copyable next to the Send form, the
   field stays empty with a plain account-id placeholder, and the round trip is: A creates and
   shows the id, B pastes it into B's own form. Recorded as a ruling, not a preference.
+
+---
+
+## T16 — shipped 2026-10-04: `58466a7c…` is live, and the briefing was a document too
+
+`58466a7c…` is live at `https://pocketful.getn.space/`. Board #18's blocker is cleared: the
+rollback was **rehearsed** against the previous release — the first real revert this build could
+exercise, because `dc5e8b0b` was the first release there was anything to go back to. The store
+hazard was answered with the load-bearing measurement rather than an assurance: one digest
+**plus an `mtime` predating the whole window**, which is what proves neither restart so much as
+opened the file — a byte comparison alone would have passed even if a restart had rewritten
+identical content. The full operator record (both §T16 records, the before/after quotes, the
+rollback command, the store hash) is in `ops/README.md` §T16.
+
+**The finding that belongs in the plan rather than in a transcript.** A role briefing given to
+the deploy-engineer stated, under a heading marked *verified 2026-10-02*, that
+`/etc/letsencrypt/renewal/` held exactly **one** lineage and that `pocketful.getn.space` had **no
+nginx `server` block** of its own, so requests fell through to the `getn.space` block. The host
+shows the opposite: its own block (`/etc/nginx/sites-available/pocketful.getn.space`) and its own
+lineage (`/etc/letsencrypt/renewal/pocketful.getn.space.conf`, `authenticator = webroot`, exp
+`2026-12-31`), both created `2026-10-02 07:20`. The same briefing also carried a **standing
+authorization to renew the `getn.space` lineage** — an authorization to fix a topology it had
+just described wrongly, which would have meant "renewing" a lineage the briefing said did not
+exist. `ops/README.md`'s TLS section was right; the briefing was stale.
+
+This is the build's oldest lesson with a new witness: **what is in force is read from the
+artifact, never inferred from a document that describes it** — and a briefing is a document. A
+doc's confidence ("verified") is not evidence, and a *dated* doc is a claim about that date, not
+about now. The deploy was made with **no** nginx, TLS or DNS change; `getn.space` was read only.
+
+**One correction made against the ship's own report, kept here because it is the right shape.**
+The T16 report claimed the demo notice covers "every `text/html` response". Measured on the live
+revision, `PUT` / `DELETE` / `PATCH` return `501 text/html;charset=utf-8` from
+`BaseHTTPRequestHandler.send_error` with **zero** markers — HTML the application never builds.
+The markered set is "every document `_document` builds", not "every HTML response the server
+emits", and T19 now carries exactly that sentence. The defect was in shipped bytes of a file its
+reporter does not own, and it was **reported rather than patched on the host**: a host-side patch
+would be invisible to the gate and to the tree.
+
+**Divergence carried forward — measured, not predicted.** By the end of the T16 window the dev
+working tree had already moved off the shipped revision: `app/web.py`
+`02eaafdd…` → `686368f3…`, `app/selfcheck.py` → `79bb9744…`, so the 4-tree gate pin went
+`58466a7c…` → `aefd7e04dc998bd881c1b101ccbc050b65cc37c92e216450b164ae4a5bb4e9d3` and the 3-tree
+release pin `7fe22cc6…` → `04c16b73699da3e52147be8f7b995b88ae94d6abfe2c0d6793df91cacbaf2f45`. The
+**host was re-measured at the same moment and still matches the shipped bytes exactly**
+(`/srv/pocketful/current` → `7fe22cc6…`, `app/web.py` → `02eaafdd…`), so the divergence is in the
+tree, not on the site. Neither edit is behavioural and **neither justifies a deploy**: the next
+ship is a **new** revision with a **new** pin, gated afresh from the settled tree — never a
+re-cut of `58466a7c`, and never a copy of whatever the working tree happens to hold. Recorded in
+`ops/README.md` §T16 rather than absorbed.
+
+---
+
+## T20–T26 — the redesign and the opening grant (2026-10-04, planner)
+
+**The ask (owner, room `4eee1f27`, msg `e0a99dc2`):** the site "looks so confusing and simple" —
+redesign it, with **clear account names**, **account creation**, and **$100 for every new account**.
+
+**Baseline this section is written against:** 4-tree pin
+`6c766987d2cb2909be91bff5cdb9b8e342386104da83038693cedf8267ef4d73`, measured in the dev tree at
+the moment of writing. Two of the three asks are presentation. The third is money, and it is the
+only part that can corrupt the build.
+
+### C1 — the opening grant (money; the long pole)
+
+```
+C1.1  OPENING_GRANT_MINOR = 10_000  (100.00 USD), integer minor units, defined ONCE in
+      ledger/core.py. Never a float, never a decimal string, never "100 dollars".
+      Nothing else re-spells it.
+
+C1.2  SYSTEM_ACCOUNT_ID = "__system__" — a real row in `accounts`, USD,
+      allow_overdraft = True. Created lazily, inside the same transaction as the
+      first grant. No boot step, no migration: it must appear on the live DB that
+      already has accounts and no system row.
+
+C1.3  The grant is a REAL transfer: one `transfers` row (__system__ -> <new>) and
+      TWO `ledger_entries` (-10000 on __system__, +10000 on <new>) summing to zero.
+      Never a single-entry credit. I1 and I2 must hold after any number of grants.
+
+C1.4  Atomic. The account row, the transfers row, both entries and both version
+      bumps land in ONE run_immediate transaction. A grant that fails leaves NO
+      account and NO entries. The account and its opening grant are ONE unit of
+      state — not two steps that coordinate.
+
+C1.5  Exactly once per account_id, guaranteed by the accounts PRIMARY KEY — not by
+      a counter, not by a check-then-act. A duplicate raises AccountExists BEFORE
+      any write in that transaction, so a refused duplicate moves nothing.
+
+C1.6  The ledger primitive is OPT-IN:
+          Ledger.open_account(*, account_id, owner_id, currency,
+                              allow_overdraft=False, opening_grant_minor=0) -> Account
+      opening_grant_minor defaults to 0, so every existing caller and every existing
+      fixture keeps its exact current behaviour. Giving the grant is the API's
+      POLICY, not the ledger's default. (This is what keeps the blast radius off
+      tests/scenarios.py and the 63 API checks.)
+
+C1.7  Reserved id. open_account refuses account_id == SYSTEM_ACCOUNT_ID, so the
+      system account can never be created or re-created through the public path.
+
+C1.8  No client mint path. Ledger.transfer() refuses any transfer whose
+      from_account_id OR to_account_id is SYSTEM_ACCOUNT_ID. C1.3 is the ONLY way
+      money leaves the system account. POST /transfers touching it answers 4xx —
+      never a 500, never 2xx. Without this the $100 is decorative: the system
+      account carries allow_overdraft, so one POST /transfers would mint any amount.
+      HONEST LIMIT, stated not hidden: registration is open, so the cap is per
+      account, not global. C1.8 makes the grant un-bypassable; it does not make the
+      demo scarce.
+```
+
+### C2 — POST /accounts
+
+```
+C2.1  account_id becomes REQUIRED and CLIENT-SUPPLIED. The server must not mint one.
+      api/app.py:_post_accounts does `uuid.uuid4().hex` when it is omitted — a
+      server-generated key, forbidden by INVARIANTS §3, and now a double-grant:
+      a retry after an unknown outcome opens a SECOND account with a SECOND $100.
+      Missing or blank -> 400, nothing created.
+
+C2.2  Duplicate account_id -> 409, nothing created, no second grant. (Unchanged.)
+
+C2.3  Success -> 201 with balance_minor = 10000. (Was hard-coded 0.)
+
+C2.4  RULING on §3, written here so it is not re-litigated. POST /accounts is NOT
+      replay-keyed. The account_id IS the natural idempotency key: client-supplied,
+      unique, and a repeat is REJECTED rather than replayed. §3's purpose — never
+      apply twice — is met by C1.5 + C2.2. §3's "return the original result" clause
+      is deliberately NOT met for creation: a 409 plus a balance read converges a
+      retrying client anyway. We accept this because the alternative — threading
+      idempotency keys through create — puts ui-pending.json, the double-spend
+      guard, on a second operation type for no gain in exactly-once-ness.
+      THE REVIEWER SHOULD ATTACK THIS RULING. It dies the moment C2.1 is relaxed.
+
+C2.5  Names are on the READ path, not remembered by the browser (this corrects an
+      earlier draft of C3). Feasibility was measured by the frontend-engineer:
+      GET /accounts/<id>/balance returns only account_id, currency, balance_minor —
+      no owner_id — which is WHY the page can only print `acct-…`. So:
+        - the balance read exposes `owner_id`;
+        - the activity read carries the counterparty's `owner_id` alongside
+          `counterparty_account_id`.
+      The switcher list still needs enumeration, and that stays client-side (C3.3).
+```
+
+### C3 — the UI
+
+```
+C3.1  A wallet has a NAME (owner_id — what a person reads) and an ADDRESS
+      (account_id — what a payer types). The name is the heading; the address is
+      secondary and copyable. A raw `acct-…` id is never the largest thing on the
+      page, and never the only thing identifying an account.
+
+C3.2  Creation asks for a NAME, and optionally an ADDRESS. If the address is blank
+      the BROWSER derives a readable one from the name and sends it explicitly —
+      the server still never mints (C2.1). A 409 renders as "that name is taken —
+      pick another" with the form still filled in. Nothing is created twice.
+
+C3.3  Finding your way back. The browser remembers the accounts it created in ONE
+      cookie, `pocketful_accounts` (JSON list of ids only, capped at 12, Path=/,
+      HttpOnly, SameSite=Lax) and renders them as a switch list. No new list
+      endpoint: on an unauthenticated host a list route lets anyone enumerate every
+      account, and this tree already holds "one source of truth for a balance"
+      sacred. The cookie holds IDS ONLY — never a name, never a balance.
+
+C3.4  The cookie is NOT a source of truth. Every name, balance and activity row
+      comes from the server for the active account. An id the server does not know
+      renders as unavailable and is dropped on the next write — it must never crash
+      the page and never be shown with an invented balance.
+
+C3.5  No JavaScript. Server-rendered HTML + CSS only, as today. The wallet is a view
+      and never holds a key; a JS runtime is a new place for one to be minted.
+
+C3.6  The demo notice still ships. DEMO_NOTICE and _document remain the only
+      document assembler in app/web.py, so the notice stays a property of the
+      assembler rather than of each page. The T19 narrowing stays true — the claim
+      is "every document _document builds". Do not re-widen it.
+
+C3.7  The welcome is a ledger ROW, not a note. The create-success response carries
+      the new account and its balance and NO string that announces the grant — no
+      banner, no badge, no note, no "welcome" copy on any render path. The user
+      learns the $100 the way they learn every other movement: from the activity row
+      `Received from Pocketful  +$100.00`, which is true on EVERY render. Ratified as
+      DESIGN-SPEC §5.8 option (c) on 2026-10-04; `WELCOME_BONUS_LABEL` was deleted
+      rather than left as dead copy. Checkable as a negative: the create-success
+      document contains no occurrence of "welcome" (case-insensitive).
+      Two ways to break it, both already ruled out — do not re-open either: (a) a
+      "new accounts start with $100.00" note on `create_form` is FALSE for a EUR
+      choice, because the grant is USD-only (C1.7; `api/selfcheck.py:257`) while the
+      form offers a freely editable currency field; (b) keying copy on
+      `counterparty_account_id == "__system__"` couples user-visible text to a
+      reserved ledger internal. The activity row already says the true thing.
+```
+
+### C4 — the seam (who owns which file)
+
+```
+app/design.py   NEW — owner: designer
+    TOKENS: dict[str, str]     the one place a colour, space or radius is written
+    STYLE: str                 the <style> payload, built from TOKENS
+    _esc(value) -> str         the app's only escaper, exported
+    wallet_header(*, name, address, balance_display) -> str
+    account_switcher(*, accounts, active_id) -> str
+    create_form(*, action, name_value, address_value, error) -> str
+    send_form(*, action, address) -> str
+    activity_table(*, rows) -> str
+    banner(*, kind, message) -> str          # kind in {"error", "notice"}
+    empty_state(*, message) -> str
+  Pure functions: no routes, no ledger, no network, no file reads. Every
+  interpolated value passes through _esc. States that must exist, not just the
+  three: wallet view (name + balance + activity + send), creation, brand-new
+  account showing the welcome $100, error banner, unconfirmed/pending block,
+  unknown cookie entry, very long name, many accounts, insufficient funds.
+
+app/web.py      owner: frontend-engineer
+  Imports the above (including _esc — ONE escaper in the app). Keeps DEMO_NOTICE,
+  _document, the routes, the PRG flow, the no-key-in-the-browser rule and the
+  pending-store handling. Wires C2.1–C2.3 and the C3.3 cookie.
+
+WHY A NEW MODULE rather than the designer writing into app/web.py: one owner per
+file. Two agents editing app/web.py is the exact way this build corrupts itself.
+The designer gets a gated, testable artifact (app/ is inside the 4-tree pin) and
+the frontend-engineer keeps sole ownership of the routes.
+```
+
+### Sequencing
+
+```
+Wave 1 (parallel, no blockers)   T20 ledger grant      -> ledger-engineer
+                                 T23 app/design.py     -> designer
+Wave 2 (after T20)               T21 API surface       -> integrator
+                                 T22 grant invariants  -> test-author
+Wave 3 (after T21, T23)          T24 app/web.py        -> frontend-engineer
+Wave 4 (after T22, T24)          T25 adversarial review-> reviewer
+Wave 5 (after T24, T25)          T26 ship + rollback   -> deploy-engineer
+```
+
+The 4-tree pin covers `tests ledger api app`, so all four trees will move. T26 is a **new**
+revision with a **new** pin, gated afresh from the settled tree — never a re-cut of `6c766987`.
+
+**Freeze before T25, imposed because the pin is not yet stable enough to mean anything.** Measured
+2026-10-04 across one afternoon, with four agents in the trees: `779ccc0c` → `b75c51a8` →
+`5fe92c3d` → `89d5c26c`, at roughly two-minute intervals, each a revision nobody chose. So a
+reviewer cannot obey "pin the revision you read" while the revision changes underneath it, and
+"before == after" only ever covers the window of one run. **T25 does not start until the trees are
+quiet, and its first act is to confirm its pin holds for the whole duration of the review.** T26
+then gates the frozen tree afresh. Neither the T20 pin nor the T23 pin is the current revision;
+they are evidence about their own windows and nothing more.
+
+### C5 — gate reach, measured 2026-10-04 (a correction to something I stated flatly)
+
+I told the designer and the frontend-engineer that `app/selfcheck.py`'s rows are "constraints, not
+gate evidence" because `run_gate.sh` does not run that driver. The conclusion was wrong, and
+`tests/README.md:337-350` records me making this same mistake once before, in T18. The caller
+search, run rather than assumed:
+
+```
+IN   app/selfcheck.py  scenario_web_ui           :407-668
+     driven by tests/test_persist_ordering.py:189 (import at :50),
+     every row it produces asserted green at :208/:211 — and phase 1 runs that file.
+OUT  app/selfcheck.py  run_local_checks          :669-743
+     only main() (:779) calls it; nothing runs app.selfcheck without --child.
+     This is where :696 (render_wallet signature), :698 (both-ids pending row)
+     and :737 (format_minor) live — the three rows cited to the team.
+```
+
+**Gate reach is per function, not per file.** Both claims in circulation were true of their own
+rows and false as generalisations: the designer's cited rows are genuinely outside the gate, the
+file is genuinely partly inside it.
+
+**The consequence for the redesign, which is the part that bites.** `scenario_web_ui` is
+gate-covered *and* it asserts UI copy — `"Send money" in page` and `"$100.00" in page` (`:428`),
+`"Unconfirmed transfers"` (`:491`), the notice rows (`:445-467`), the PRG rows (`:486-538`), the
+protocol and internal error paths (`:602-653`), and the pending-store record counts. A redesign
+that renames or restructures those surfaces reddens phase 1 through rows no row name points at —
+the incidental-coverage shape `tests/README.md:346` describes. So the wiring task owns updating
+them deliberately in the same edit, and **may not delete them to get green** nor narrow the blanket
+assertion, which lives in the test-author's file.
+
+### C6 — adjudications after T20 landed (2026-10-04)
+
+T20 is in the tree and the ledger-engineer reported it with the gate quoted. Three questions came
+back that the plan had not pinned; decided rather than deferred, because money-moving code was
+about to be written against them.
+
+1. **Currency — the grant is USD-only.** The system row is one row
+   (`SYSTEM_ACCOUNT_CURRENCY = "USD"`), and §1 forbids cross-currency arithmetic without a recorded
+   rate. So the API requests a grant **only when the account is USD**; a non-USD account still
+   opens, ungranted, at balance 0. Per-currency system accounts were rejected: they multiply the
+   system rows and the grant policy for a currency the product does not offer. The web UI creates
+   USD accounts only, so "every new account starts with $100" stays true of everything the product
+   makes, and the API keeps its generality.
+
+2. **The name is `owner_id`. No new column.** A `name` column would be a second identity field that
+   can disagree with `owner_id` — this build's recurring "two sources of truth" failure. The whole
+   change is a projection drop: `Ledger.get_account` already returns `owner_id`.
+   `SYSTEM_ACCOUNT_OWNER_ID` becomes **`"Pocketful"`**, not `"system"`: C2.5 puts the counterparty
+   owner on every grant activity row, so that string is user-visible copy on every welcome credit,
+   and the UI must not special-case the system id to render it.
+
+3. **The create-path idempotency *store* change is OFF the board.** The ledger-engineer costed a
+   nullable `idempotency_keys.transfer_id` or a sibling table for a `POST /accounts` key. C2.4
+   already ruled that create is not replay-keyed — the account id is the natural key — so that
+   schema change buys nothing and is not to be built.
+
+**Second-order effect of the grant, found the hard way (2026-10-04).** Every account now carries an
+opening-grant entry, so **any assertion that counts entries, activity rows or transfers per account
+shifts by one** the moment the grant exists. It surfaced as the last red row in gate phase 4:
+`the storm wrote 10 non-negative debits plus its one funding credit [items=12]` — the payer's
+activity is the funding credit *plus* the grant. That is an assertion to update **with the reason
+attached**, never a defect to chase and never an assertion to weaken. The reviewer's consequence:
+check whether any other count-shaped row was reconciled to a new number without confirming the
+delta is the grant. A stale count that still passes is the shape that hides.
+
+**Sharpened after the first full-gate run on the grant tree (2026-10-04, phase 1 red with 12 rows).**
+Two forms of the same trap, both live in the current red set:
+
+- *A balance row off by exactly `+10000` is mechanical; a count row is not.* `test_web_reload.py`'s
+  `10900 != 900` / `10800 != 800` are the grant, exactly. `test_client_retry.py`'s
+  `6 != 3 : the funding transfer plus TWO sends` is **not** — the grant adds one transfer per
+  account *created*, so a count moving by +3 needs the created-account count to account for it.
+  Rule for the reviewer: **for every count-shaped row that changed, name the accounts it creates
+  and confirm the delta equals the number of grant entries.** A count reconciled to whatever made
+  it pass is the defect, not the fix.
+- *A red baseline disarms the mutant teeth.* `test_persist_ordering.py::test_the_scenario_is_green_before_anything_is_mutated`
+  exists so that its sibling's `the deferral must move exactly the ordering row` means something.
+  With the baseline red, that sibling reports `4 != 1` and **cannot distinguish a working tree from
+  a broken one**. Cause here is the balance rows above; the consequence is still that no mutant
+  claim in that file may be trusted until the baseline is green again.
+- *A row's label is a claim about the expected state; the condition beside it is the measurement.*
+  This one cost the planner a false alarm on 2026-10-04, sent to two agents. The failure list showed
+  `[WEB] the second press moved money again: payer 9300, payee 700`, which reads as a double-spend.
+  The row is `app/selfcheck.py:573` `check(... == 9300 and ... == 700, ...)` — a **positive
+  assertion that a deliberate second press moved exactly 200**. It failed only because the literals
+  are short by the grant. In a `check(cond, label)` harness a label in a failures list names the
+  assertion that failed, not the defect observed. **Rule for the reviewer: read the condition at the
+  cited line before believing any label in a gate log** — including labels the planner quotes.
+  Corollary: those labels **bake the stale literals as strings** ("payer 9500, payee 500"), so an
+  owner who fixes the number and leaves the label leaves the log printing a false story. A stale
+  label is a false witness, and the next reader has no way to tell it from a measurement.
+  Bound on the class: in that same block `amount_minor == 500` (`:497`, `:547`) and
+  `len(debits) == 1` (`:401`, `:547`) are unaffected — a grant is a credit, so it moves balances and
+  entry counts, never transfer amounts or debit counts. A row failing on an amount or a debit count
+  is not the grant and needs its own explanation.
+
+**Named residual, recorded rather than quietly fixed.** C1.8 closes the *system account* as a mint
+path. It does not close minting in general: `POST /accounts` accepts `allow_overdraft` from an
+unauthenticated client (`api/app.py:280`), so anyone can open an overdraft account and issue
+unlimited balanced transfers from it. I1/I2 still hold — it is the overdraft policy doing its job,
+not a missing pair — so this is a capability limit, not an invariant break. Left out of this pass
+deliberately: closing it is a behavioural change to a public surface carrying gate checks, and it
+deserves its own task and its own review rather than riding in on a redesign. Added to the
+reviewer's attack list. **The honest consequence: the $100 grant is un-bypassable, and the demo is
+not made scarce.**
+
+### What this deliberately does NOT include
+
+- No accounts-list endpoint (C3.3) — disclosure, and a second enumeration surface.
+- No retroactive grant to existing accounts. "Every NEW account." Existing balances are
+  untouched, and the live DB needs no migration: `__system__` appears on the first grant.
+- No client-side JavaScript, no auth, no rate limit. The demo stays what it is, and says so on
+  every page `_document` builds.
+- `ui-pending.json` is not touched by any of this. Losing it is still a double-spend.

@@ -81,10 +81,15 @@ def _wait_until_answering(port, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1):
+                pass
             return
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            # Close the refusal response: urllib's addbase subclasses
+            # tempfile._TemporaryFileWrapper, so an unclosed HTTPError is closed
+            # only at GC and emits a ResourceWarning.
+            exc.close()
             return
         except OSError:
             time.sleep(0.02)

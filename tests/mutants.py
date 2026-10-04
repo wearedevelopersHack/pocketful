@@ -28,6 +28,15 @@ RETRIES = 60
 # imports from the package under test.
 MAX_MINOR = 2 ** 53 - 1
 
+# Mirrors ledger.core.SYSTEM_ACCOUNT_ID / SYSTEM_ACCOUNT_CURRENCY (§C1), for the
+# same reason. Only `open_account`'s opening grant touches them.
+SYSTEM_ACCOUNT_ID = "__system__"
+SYSTEM_ACCOUNT_CURRENCY = "USD"
+
+# The grant the ledger's §C1 policy uses. Defined here so the control's grant
+# branch can be exercised without importing the package under test.
+GRANT_FOR_TEST = 10_000
+
 
 class MutantError(Exception):
     pass
@@ -72,16 +81,65 @@ class ControlLedger:
         raise last
 
     # -- §2.1 surface -----------------------------------------------------
-    def open_account(self, *, account_id, owner_id, currency, allow_overdraft=False):
+    def open_account(self, *, account_id, owner_id, currency, allow_overdraft=False,
+                     opening_grant_minor=0):
+        """Mirrors ``ledger.core.Ledger.open_account``, opening grant included.
+
+        ``opening_grant_minor`` is part of the real §C1 signature and defaults to
+        0, so the control stays call-compatible with the ledger it stands in for.
+        The parameter is not decoration: a control whose signature drifts from
+        its subject's is the *inert mutant* shape — the moment a caller passes the
+        keyword, the stand-in either raises ``TypeError`` (measuring the wrapper
+        instead of the scenario) or silently drops money. So a positive grant here
+        is posted the only way the ledger posts one: a balanced transfer out of
+        ``__system__``, two entries summing to zero, in the same transaction as
+        the account row.
+        """
+        if account_id == SYSTEM_ACCOUNT_ID:
+            raise MutantError(f"{SYSTEM_ACCOUNT_ID!r} is reserved")
+        grant = self._validate_grant(opening_grant_minor)
+        if grant and currency != SYSTEM_ACCOUNT_CURRENCY:
+            raise MutantError("an opening grant is USD only")
+
         self._exec(
             "INSERT INTO accounts (account_id, owner_id, currency, allow_overdraft,"
             " version, created_at) VALUES (?,?,?,?,0,?)",
             (account_id, owner_id, currency, 1 if allow_overdraft else 0, "now"),
         )
+        if grant:
+            self._ensure_system_account()
+            self._write_pair(self._new_transfer_id(), SYSTEM_ACCOUNT_ID,
+                             account_id, grant, SYSTEM_ACCOUNT_CURRENCY)
         self.conn.commit()
         return SimpleNamespace(
             account_id=account_id, owner_id=owner_id, currency=currency,
             allow_overdraft=allow_overdraft, created_at="now",
+        )
+
+    def _validate_grant(self, amount_minor):
+        """Same contract as ``ledger.core._require_opening_grant``: a plain
+        non-negative int, never coerced from a float or a bool."""
+        if isinstance(amount_minor, bool) or not isinstance(amount_minor, int):
+            raise MutantInvalidAmount("opening grant must be a plain int")
+        if amount_minor < 0:
+            raise MutantInvalidAmount("opening grant must not be negative")
+        if amount_minor > MAX_MINOR:
+            raise MutantInvalidAmount("opening grant is out of range")
+        return amount_minor
+
+    def _ensure_system_account(self):
+        """The lazily-created system row: USD, overdraft on, so grants accumulate
+        as a negative balance instead of raising InsufficientFunds. Created once —
+        the second grant must find the row, not collide with it."""
+        present = self._exec(
+            "SELECT 1 FROM accounts WHERE account_id = ?", (SYSTEM_ACCOUNT_ID,)
+        ).fetchone()
+        if present is not None:
+            return
+        self._exec(
+            "INSERT INTO accounts (account_id, owner_id, currency, allow_overdraft,"
+            " version, created_at) VALUES (?,?,?,1,0,?)",
+            (SYSTEM_ACCOUNT_ID, "__system__", SYSTEM_ACCOUNT_CURRENCY, "now"),
         )
 
     def get_balance(self, account_id):

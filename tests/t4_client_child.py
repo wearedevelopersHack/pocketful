@@ -101,7 +101,10 @@ def main(argv):
             with urllib.request.urlopen(request, timeout=10) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read()
+            try:
+                status, raw = exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
         if crash:
             # Die with the server's answer already read and the record still
             # pending: the crash window this scenario is about.

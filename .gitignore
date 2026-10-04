@@ -32,3 +32,8 @@ env/
 .idea/
 *.swp
 .DS_Store
+
+# Planner scratch notes, written to disk beside the working tree. The room is the
+# record for these; publishing them alongside the code adds noise to the repo and
+# nothing to the submission. (2026-10-04)
+.planner-*.md

@@ -50,6 +50,8 @@ import unittest
 import urllib.error
 import urllib.request
 
+from ledger import OPENING_GRANT_MINOR
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MINT = "acct-t4-mint"
@@ -57,6 +59,15 @@ PAYER = "acct-t4-payer"
 PAYEE = "acct-t4-payee"
 FUND = 1000
 SEND = 500
+
+# T20: opening a USD account mints a balanced grant transfer from `__system__`
+# (ledger.OPENING_GRANT_MINOR). `_fund()` opens three USD accounts, so every
+# scenario below carries three extra `transfers` rows (one per opening), and each
+# account it opens starts at GRANT rather than 0. Counted, not fudged: the counts
+# are expressed as the scenario's own transfers plus GRANT_TRANSFERS so the delta
+# is visible in the assertion rather than hidden in a picked number.
+GRANT = OPENING_GRANT_MINOR
+GRANT_TRANSFERS = 3
 
 
 def _import_app():
@@ -98,10 +109,15 @@ def _wait_until_answering(port, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1):
+                pass
             return
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            # Close the refusal response: urllib's addbase subclasses
+            # tempfile._TemporaryFileWrapper, so an unclosed HTTPError is closed
+            # only at GC and emits a ResourceWarning.
+            exc.close()
             return
         except OSError:
             time.sleep(0.02)
@@ -194,9 +210,12 @@ class ClientRetrySurvivesACrash(unittest.TestCase):
                              f"{result.stderr.decode()[-2000:]}")
 
             # Server side: applied once.
-            self.assertEqual(self._transfer_count(db_path), 2,
-                             "the funding transfer plus exactly one send")
-            self.assertEqual(self._balance(db_path, PAYER), FUND - SEND)
+            self.assertEqual(self._transfer_count(db_path), 2 + GRANT_TRANSFERS,
+                             "the funding transfer plus exactly one send, plus one "
+                             "opening grant per account _fund() created")
+            self.assertEqual(self._balance(db_path, PAYER), GRANT + FUND - SEND,
+                             "the payer starts at the T20 grant, is funded, then "
+                             "debited once")
 
             # Client side: the key is on the wire and the record is still pending,
             # so `resume` has something to recover.
@@ -235,9 +254,10 @@ class ClientRetrySurvivesACrash(unittest.TestCase):
 
             # The ledger, read with SQL: one send, not two, and the retry's
             # transfer_id is the one the first attempt created.
-            self.assertEqual(self._transfer_count(db_path), 2)
-            self.assertEqual(self._balance(db_path, PAYER), FUND - SEND,
-                             "the payer must be debited exactly once")
+            self.assertEqual(self._transfer_count(db_path), 2 + GRANT_TRANSFERS)
+            self.assertEqual(self._balance(db_path, PAYER), GRANT + FUND - SEND,
+                             "the payer starts at the T20 grant, is funded, then "
+                             "debited exactly once")
             self.assertEqual(self._recorded_keys(db_path),
                              sorted(["t4-fixture-fund", sent[0]]),
                              "the ledger recorded the fixture key and the "
@@ -258,8 +278,8 @@ class ClientRetrySurvivesACrash(unittest.TestCase):
             outcomes = _outcomes(self.log)
             self.assertEqual(len(outcomes), 1)
             self.assertEqual(outcomes[0]["status"], "applied")
-            self.assertEqual(self._transfer_count(db_path), 2)
-            self.assertEqual(self._balance(db_path, PAYER), FUND - SEND)
+            self.assertEqual(self._transfer_count(db_path), 2 + GRANT_TRANSFERS)
+            self.assertEqual(self._balance(db_path, PAYER), GRANT + FUND - SEND)
             self.assertEqual(len(_requests(self.log)), 1)
 
     # -- the mutant behind the assertion ----------------------------------
@@ -293,10 +313,12 @@ class ClientRetrySurvivesACrash(unittest.TestCase):
                              "a fresh key is a fresh transfer, so the ledger "
                              "applies it rather than replaying")
 
-            self.assertEqual(self._transfer_count(db_path), 3,
-                             "the funding transfer plus TWO sends — the double spend")
-            self.assertEqual(self._balance(db_path, PAYER), FUND - 2 * SEND,
-                             "the payer is debited twice, which is the whole defect")
+            self.assertEqual(self._transfer_count(db_path), 3 + GRANT_TRANSFERS,
+                             "the funding transfer plus TWO sends — the double spend "
+                             "— plus one opening grant per account _fund() created")
+            self.assertEqual(self._balance(db_path, PAYER), GRANT + FUND - 2 * SEND,
+                             "the payer starts at the T20 grant, is funded, then is "
+                             "debited twice, which is the whole defect")
             self.assertEqual(len(self._recorded_keys(db_path)), 3)
 
 

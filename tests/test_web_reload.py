@@ -64,6 +64,8 @@ from app.send import RetryableSendError
 from app.wallet import Wallet
 import app.web as app_web
 
+from ledger import OPENING_GRANT_MINOR
+
 MINT = "acct-t9-mint"
 PAYER = "acct-t9-payer"
 PAYEE = "acct-t9-payee"
@@ -71,6 +73,12 @@ FUND = 1000
 SEND_TEXT = "1.00"
 SEND = 100
 FIXTURE_KEY = "t9-fixture-fund"
+
+# T20: opening a USD account mints a balanced grant transfer from `__system__`
+# (ledger.OPENING_GRANT_MINOR). `_fund()` opens three USD accounts, so PAYER
+# starts at the grant rather than 0. The grant is a credit to PAYER, so `_debits`
+# (entries < 0) is unaffected; only the balance carries it.
+GRANT = OPENING_GRANT_MINOR
 
 REDIRECTS = (301, 302, 303, 307, 308)
 
@@ -103,7 +111,10 @@ class LostFirstTransferResponse:
             with urllib.request.urlopen(request, timeout=10) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read()
+            try:
+                status, raw = exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
         if not self._lost and method == "POST" and urlsplit(url).path == "/transfers":
             self._lost = True
             raise OSError("connection reset while reading the response")
@@ -167,7 +178,10 @@ class UnforeseenTransferResponse:
             with urllib.request.urlopen(request, timeout=10) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read()
+            try:
+                status, raw = exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
         if not self._sprung and method == "POST" and urlsplit(url).path == "/transfers":
             self._sprung = True
             raise UnforeseenFailure("a type no `except` clause names")
@@ -254,10 +268,16 @@ def _wait_until_answering(port, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1):
+                pass
             return
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            # An HTTPError wraps the response fp (urllib's addbase subclasses
+            # tempfile._TemporaryFileWrapper); if it is not closed the close is
+            # deferred to GC and emits a ResourceWarning. Close it here so the
+            # warning channel stays meaningful.
+            exc.close()
             return
         except OSError:
             time.sleep(0.02)
@@ -279,7 +299,10 @@ def _request(port, method, path, form=None):
         with opener.open(request, timeout=10) as response:
             return response.status, dict(response.headers), response.read().decode()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers), exc.read().decode()
+        try:
+            return exc.code, dict(exc.headers), exc.read().decode()
+        finally:
+            exc.close()  # unclosed HTTPError -> ResourceWarning at GC
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -409,11 +432,11 @@ class ReloadOfTheSendResponse(unittest.TestCase):
         self.assertEqual(self._debits(db_path), 1,
                          f"T9 double debit: the reload moved money twice; payer "
                          f"balance is {self._balance(db_path)}, "
-                         f"expected {FUND - SEND}")
+                         f"expected {GRANT + FUND - SEND}")
         self.assertEqual(self._client_keys(db_path), [records[0].key],
                          "T9 extra key: the ledger recorded more than the one "
                          "client key")
-        self.assertEqual(self._balance(db_path), FUND - SEND)
+        self.assertEqual(self._balance(db_path), GRANT + FUND - SEND)
         return records
 
     def test_a_reload_of_the_post_response_mints_no_second_key(self):
@@ -447,7 +470,7 @@ class ReloadOfTheSendResponse(unittest.TestCase):
                 self.assertIn(status, REDIRECTS)
                 self.assertEqual(self._debits(db_path), 1,
                                  "Retry must replay the pending key, not add a debit")
-                self.assertEqual(self._balance(db_path), FUND - SEND)
+                self.assertEqual(self._balance(db_path), GRANT + FUND - SEND)
 
     # -- the teeth ------------------------------------------------------------
 
@@ -489,7 +512,7 @@ class ReloadOfTheSendResponse(unittest.TestCase):
                                  "transfer to the ledger")
                 self.assertEqual(self._debits(db_path), 2,
                                  "the reload moved money a second time")
-                self.assertEqual(self._balance(db_path), FUND - 2 * SEND,
+                self.assertEqual(self._balance(db_path), GRANT + FUND - 2 * SEND,
                                  "one duplicated debit, and the payer pays it")
                 self.assertEqual(len(set(transport.sent_keys)), 2,
                                  "two distinct keys crossed the wire")
@@ -586,7 +609,7 @@ class ReloadOfTheSendResponse(unittest.TestCase):
                 self.assertEqual(len(self._records()), 2)
                 self.assertEqual(self._debits(db_path), 2,
                                  "the re-POST moved money a second time")
-                self.assertEqual(self._balance(db_path), FUND - 2 * SEND)
+                self.assertEqual(self._balance(db_path), GRANT + FUND - 2 * SEND)
 
     def test_a_fallback_that_drops_the_record_loses_the_key(self):
         """The other half of clause 2, and the teeth under the state assertion.

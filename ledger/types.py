@@ -49,6 +49,24 @@ class SameAccountTransfer(LedgerError):
     """Payer and payee are the same account."""
 
 
+class SystemAccountTransfer(LedgerError):
+    """A transfer named the system account at one end.
+
+    The system account carries ``allow_overdraft`` precisely so opening grants
+    can debit it without limit; a client-facing transfer is therefore the wrong
+    door. The opening grant is the ONLY sanctioned path out of that account, so
+    any other transfer touching it is refused rather than honoured.
+    """
+
+
+class ReservedAccountId(LedgerError):
+    """The account id is reserved for the system account.
+
+    Refused on the public ``open_account`` path so the system account can never
+    be created — or re-created — by a caller.
+    """
+
+
 class InsufficientFunds(LedgerError):
     """The payer balance would go negative and overdraft is not allowed."""
 
@@ -86,6 +104,12 @@ class ActivityItem:
     arriving. There is exactly one encoding of the sign on this type, so the
     amount and the direction can never disagree. ``balance_after_minor`` is the
     signed account balance immediately after this entry was applied.
+
+    ``counterparty_owner_id`` is the other account's owner, resolved by
+    ``list_activity`` in the same read (plan §C2.5). It is an identity, not a
+    guaranteed display label; it sits BESIDE ``counterparty_account_id`` and
+    never replaces it, so a caller that shows the name can still show — or
+    link — the address it actually paid.
     """
 
     entry_id: str
@@ -94,4 +118,5 @@ class ActivityItem:
     amount_minor: Money
     balance_after_minor: Money
     counterparty_account_id: str
+    counterparty_owner_id: str
     created_at: str

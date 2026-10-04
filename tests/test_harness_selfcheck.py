@@ -243,6 +243,56 @@ class HarnessSelfCheck(unittest.TestCase):
     def test_control_passes_the_fuzz(self):
         scenarios.scenario_fuzz(self.backend(mutants.CONTROL), seed=1234, steps=60)
 
+    def test_the_control_open_account_honours_the_opening_grant(self):
+        """The control mirrors the ledger's §C1 signature, ``opening_grant_minor``
+        included, and that parameter has to *work* — not merely be accepted.
+
+        Nothing in this suite passes the keyword yet, so the grant branch is
+        reachable only from here. That is exactly how a control goes inert: the
+        call sites keep passing four arguments, the wrapper looks fine, and the
+        day a scenario does pass a grant the control either raises inside the
+        measurement or silently drops the money. So the branch is exercised and
+        asserted on its own: a balanced pair out of the system account, I1/I2/I3
+        intact, two entries and not one.
+        """
+        grant = mutants.GRANT_FOR_TEST
+        backend = self.backend(mutants.CONTROL)
+        with backend.fresh() as (_conn, ledger):
+            ledger.open_account(account_id="acct-granted", owner_id="owner-granted",
+                                currency="USD", opening_grant_minor=grant)
+
+        with backend.fresh() as (_conn, ledger):
+            self.assertEqual(ledger.get_balance("acct-granted"), grant,
+                             "the granted account holds its grant")
+            self.assertEqual(ledger.get_balance(mutants.SYSTEM_ACCOUNT_ID), -grant,
+                             "and the system account carries the negative leg")
+
+        with backend.read_conn() as conn:
+            inv.assert_all(conn)                       # I1 + I2
+            self.assertEqual(inv.entry_count(conn), 2,
+                             "the grant is a balanced pair; a control that "
+                             "posted one entry would model the defect it exists "
+                             "to be the control against")
+            (transfer_id,) = conn.execute("SELECT transfer_id FROM transfers").fetchone()
+            inv.assert_i3(conn, transfer_id)
+
+    def test_the_control_refuses_the_reserved_account_and_a_non_usd_grant(self):
+        """...and the two refusals the real primitive has, so a scenario that
+        reaches them measures the ledger and not a missing branch: the system id
+        is reserved, and a single-currency system account cannot fund EUR."""
+        backend = self.backend(mutants.CONTROL)
+        for kwargs in ({"account_id": mutants.SYSTEM_ACCOUNT_ID, "currency": "USD",
+                        "opening_grant_minor": mutants.GRANT_FOR_TEST},
+                       {"account_id": "acct-eur", "currency": "EUR",
+                        "opening_grant_minor": mutants.GRANT_FOR_TEST}):
+            with self.assertRaises(mutants.MutantError):
+                with backend.fresh() as (_conn, ledger):
+                    ledger.open_account(owner_id="owner-x", **kwargs)
+        with backend.read_conn() as conn:
+            inv.assert_all(conn)
+            self.assertEqual(inv.entry_count(conn), 0,
+                             "a refused open must write nothing at all")
+
     def test_truncating_split_still_passes_exact_divisions(self):
         """I6 detects the real defect, not 'anything unusual': a truncating split
         that happens to divide exactly is genuinely correct and must pass."""

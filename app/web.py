@@ -37,7 +37,8 @@ That is a change in kind, stated rather than implied: the field is
 client-supplied, so **an account id is the capability**. The UI no longer
 confines sends to the boot account — anyone who knows an id can act as it. On
 this demo that was already the model (ids are minted uuid hex and shown only to
-their creator), and ``DEMO_NOTICE`` says so on every page.
+their creator), and ``DEMO_NOTICE`` says so on every page the application
+renders (see ``_document`` for the server responses that are not ours).
 
 The one store stays account-agnostic. Switching accounts creates, truncates,
 moves, splits and rewrites nothing: a per-account store would lose the pending
@@ -56,7 +57,6 @@ connection and imports nothing from ``ledger/``.
 from __future__ import annotations
 
 import argparse
-import html
 import json
 import logging
 import os
@@ -66,6 +66,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 from .client import ApiClient, ApiError
+from .design import (STYLE, _esc, account_switcher, activity_table, banner,
+                     create_form, pending_block, send_form, wallet_header)
 from .keystore import PendingStore
 from .money import InvalidMoneyInput, format_minor
 from .send import (IdempotencyConflictForSend, RetryableSendError, SendProtocolError,
@@ -76,82 +78,44 @@ LOG = logging.getLogger("app.web")
 
 
 # -- rendering (pure string functions, escaped at the edge) --------------------
+#
+# Every component below lives in ``app/design.py``: this module composes the page
+# and owns no markup of its own. ``_esc`` is imported rather than reimplemented so
+# there is exactly one escaper in the application, and the stylesheet is
+# ``design.STYLE`` so a component's classes and their rules cannot drift apart.
 
-_STYLE = """
-:root { color-scheme: light dark; }
-body { font: 16px/1.5 system-ui, sans-serif; max-width: 44rem; margin: 2rem auto;
-       padding: 0 1rem; }
-h1 { font-size: 1.35rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
-.balance { font-size: 2rem; font-weight: 600; margin: .25rem 0 1rem; }
-table { width: 100%; border-collapse: collapse; }
-th, td { text-align: left; padding: .35rem .5rem; border-bottom: 1px solid #8884; }
-td.amt { text-align: right; font-variant-numeric: tabular-nums; }
-form.inline { display: flex; gap: .5rem; flex-wrap: wrap; align-items: end;
-              margin: .75rem 0; }
-label { display: flex; flex-direction: column; font-size: .85rem; gap: .2rem; }
-input { padding: .4rem; font: inherit; }
-button { padding: .45rem .9rem; font: inherit; cursor: pointer; }
-.notice { padding: .6rem .8rem; border-radius: .4rem; background: #ffd8; }
-.error  { padding: .6rem .8rem; border-radius: .4rem; background: #fdd; }
-.pending { padding: .6rem .8rem; border-radius: .4rem; background: #ffd8; }
-.demo { padding: .5rem .8rem; border-radius: .4rem; background: #eef3ff;
-        border: 1px solid #88a; font-size: .85rem; }
-code { font-size: .85em; }
-"""
-
-# The one line that has to be on every page. The UI is not a boundary: an
-# account id in the hidden field is the whole capability, and the money is
-# fixture data. Kept as a constant so a test can import the marker rather than
-# re-spell it, and rendered by ``_document`` so no page can be built without it.
+# The one line that has to be on every page the application renders. The UI is
+# not a boundary: an account id in the hidden field is the whole capability, and
+# the money is fixture data. Kept as a constant so a test can import the marker
+# rather than re-spell it, and rendered by ``_document`` so no document built
+# there can omit it. ``send_error``'s 501/505 pages are the server's, not ours —
+# see ``_document``.
 DEMO_NOTICE = ("Unauthenticated demo: an account id is the only credential, and "
                "these balances are not real money.")
 
 
-def _esc(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def _activity_rows(rows: list[ActivityRow]) -> str:
-    if not rows:
-        return "<tr><td colspan='4'>No activity yet.</td></tr>"
-    cells = []
-    for row in rows:
-        sign = "-" if row.direction == "debit" else "+"
-        cells.append(
-            "<tr>"
-            f"<td>{_esc(row.created_at)}</td>"
-            f"<td>{_esc(row.direction)}</td>"
-            f"<td>{_esc(row.counterparty_account_id)}</td>"
-            f"<td class='amt'>{_esc(sign + row.amount_display)}</td>"
-            "</tr>")
-    return "".join(cells)
-
-
-def _pending_block(pending: list) -> str:
-    if not pending:
-        return ""
-    items = "".join(
-        f"<li><code>{_esc(rec.created_at)}</code> — send "
-        f"{_esc(format_minor(rec.amount_minor, rec.currency))} from "
-        f"{_esc(rec.from_account_id)} to {_esc(rec.to_account_id)} "
-        f"<em>(not confirmed)</em></li>"
-        for rec in pending)
-    return (
-        "<section><h2>Unconfirmed transfers</h2>"
-        "<p class='pending'>These were sent but not confirmed. Pressing Retry "
-        "reuses the key already stored on the server — it cannot create a second "
-        "transfer.</p>"
-        f"<ul>{items}</ul>"
-        "<form method='post' action='/retry'>"
-        "<button type='submit'>Retry</button></form></section>")
-
-
 def _document(*, title: str, body: str) -> str:
-    """The single place a ``text/html`` document is assembled.
+    """The single place *this application* assembles a ``text/html`` document.
 
-    Both builders go through here, so the demo notice is a property of emitting
-    HTML rather than something each page has to remember: a page cannot be
-    built without it, the same way a POST cannot exit without answering.
+    Both builders go through here, so the demo notice is a property of every
+    document ``_document`` builds rather than something each page has to
+    remember: a document cannot be built here without it, the same way a POST
+    cannot exit without answering. The stylesheet is ``design.STYLE`` and the
+    shell classes (``topbar``/``shell``/``foot``) come from it, so this module
+    carries no CSS of its own.
+
+    Scope, stated rather than implied (T19, 2026-10-04). This is the
+    application's only document assembler, not the server's only HTML emitter.
+    ``WalletUIHandler`` does not override ``BaseHTTPRequestHandler.send_error``,
+    so an unsupported method (``PUT``/``DELETE``/``PATCH``) is answered with the
+    stdlib's own 501 page and a request line it cannot parse with a 505 page
+    (also stdlib ``text/html``). Neither passes through here; neither carries
+    ``DEMO_NOTICE`` — measured locally, 0 markers on both. Those pages show no
+    balance, no account id and cannot mint a key, so the notice's stated purpose
+    is not engaged on them. The claim is "every document ``_document`` builds",
+    not "every ``text/html`` response the server emits"; making the universal
+    one true would mean overriding ``send_error`` and ``error_message_format``,
+    which is new surface and its own task.
     """
     return f"""<!doctype html>
 <html lang="en">
@@ -159,12 +123,18 @@ def _document(*, title: str, body: str) -> str:
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_esc(title)}</title>
-<style>{_STYLE}</style>
+<style>{STYLE}</style>
 </head>
 <body>
-<h1>Pocketful</h1>
+<header class="topbar"><div class="topbar__inner">
+<span class="brand">Pocketful</span>
+</div></header>
+<main class="shell">
 <p class="demo" role="note">{_esc(DEMO_NOTICE)}</p>
 {body}
+</main>
+<footer class="foot"><p class="hint">Balances and activity are the server's
+values, shown verbatim.</p></footer>
 </body>
 </html>
 """
@@ -172,58 +142,37 @@ def _document(*, title: str, body: str) -> str:
 
 def render_wallet(*, account_id: str, balance_minor: int, currency: str,
                   rows: list[ActivityRow], pending: list,
-                  message: str | None = None, notice: str | None = None) -> str:
+                  message: str | None = None, notice: str | None = None,
+                  name: str | None = None, accounts: list | None = None) -> str:
     """Render the wallet view. Contains no idempotency key and no key input field.
 
-    The only hidden field is the active account id, which is not a secret and
-    not a key: it says which account the form acts as.
+    Every component is ``app/design.py``'s; this function only decides the order
+    and passes the server's values down. The only hidden field is the active
+    account id, which is not a secret and not a key: it says which account the
+    form acts as — the same rule ``_resolve_account`` applies to the POST.
+
+    ``balance_minor`` is formatted here, at the edge, by the one formatter
+    (``app/money.py``): the value travels as an integer and becomes a string only
+    on its way into markup.
     """
-    balance = format_minor(balance_minor, currency)
-    banner = ""
+    banners = ""
     if message:
-        banner += f"<p class='error' role='alert'>{_esc(message)}</p>"
+        banners += banner(kind="error", message=message)
     if notice:
-        banner += f"<p class='notice' role='status'>{_esc(notice)}</p>"
-    body = f"""<p>Account <code>{_esc(account_id)}</code></p>
-<div class="balance">{_esc(balance)}</div>
-{banner}
-<section>
-<h2>Send money</h2>
-<form class="inline" method="post" action="/send">
-<input type="hidden" name="account" value="{_esc(account_id)}">
-<label>To account
-<input name="to_account_id" required autocomplete="off" placeholder="acct-bob"></label>
-<label>Amount
-<input name="amount" required inputmode="decimal" autocomplete="off" placeholder="12.34"></label>
-<button type="submit">Send</button>
-</form>
-<p><small>Amounts are sent as whole minor units; more than two decimal places is
-rejected, never rounded.</small></p>
-</section>
-{_pending_block(pending)}
-<section>
-<h2>Create an account</h2>
-<form class="inline" method="post" action="/create">
-<label>Owner
-<input name="owner_id" required autocomplete="off" placeholder="alice"></label>
-<label>Currency
-<input name="currency" value="USD" autocomplete="off"></label>
-<label>Account id (optional)
-<input name="account_id" autocomplete="off" placeholder="blank, or an id you choose"></label>
-<button type="submit">Create</button>
-</form>
-<p><small>Creating an account mints no key and moves no money. The new id then
-appears at the top of this page — share it with whoever will pay you.</small></p>
-</section>
-<section>
-<h2>Activity</h2>
-<table>
-<thead><tr><th>When</th><th>Direction</th><th>Counterparty</th><th class="amt">Amount</th></tr></thead>
-<tbody>{_activity_rows(rows)}</tbody>
-</table>
-<p><small>Balance and activity are the server's values, shown verbatim.</small></p>
-</section>
-"""
+        banners += banner(kind="notice", message=notice)
+    body = "".join([
+        wallet_header(name=name, address=account_id,
+                      balance_display=format_minor(balance_minor, currency)),
+        banners,
+        account_switcher(accounts=accounts or [], active_id=account_id),
+        send_form(action="/send", address=account_id),
+        pending_block(pending=pending),
+        create_form(action="/create", name_value=None, address_value=None),
+        '<section class="card card--wide">',
+        '<h2 class="h2">Activity</h2>',
+        activity_table(rows=rows),
+        "</section>",
+    ])
     return _document(title=f"Pocketful — {account_id}", body=body)
 
 
@@ -360,6 +309,10 @@ class WalletUIHandler(BaseHTTPRequestHandler):
             pending=pending,
             message=message,
             notice=notice,
+            # The name comes from the same balance read as the balance itself
+            # (§C2.5), so the heading and the figure cannot come from different
+            # moments or different accounts.
+            name=wallet.owner_id,
         ))
 
     def _form(self) -> dict[str, list[str]]:

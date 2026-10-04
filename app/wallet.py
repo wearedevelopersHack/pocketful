@@ -52,6 +52,7 @@ class ActivityRow:
     balance_after_minor: int
     counterparty_account_id: str
     created_at: str
+    counterparty_owner_id: str = ""
 
 
 class Wallet:
@@ -62,6 +63,7 @@ class Wallet:
         self.store = store
         self.account_id = account_id
         self._currency: str | None = None
+        self._owner_id: str | None = None
 
     # -- reads ---------------------------------------------------------------
 
@@ -75,6 +77,9 @@ class Wallet:
         currency = payload.get("currency")
         if isinstance(currency, str):
             self._currency = currency
+        owner_id = payload.get("owner_id")
+        if isinstance(owner_id, str):
+            self._owner_id = owner_id
         return value
 
     def balance_display(self) -> str:
@@ -103,10 +108,23 @@ class Wallet:
                 balance_after_minor=item["balance_after_minor"],
                 counterparty_account_id=item["counterparty_account_id"],
                 created_at=item["created_at"],
+                counterparty_owner_id=(
+                    item.get("counterparty_owner_id")
+                    if isinstance(item.get("counterparty_owner_id"), str) else ""),
             ))
         return rows
 
     # -- writes --------------------------------------------------------------
+
+    @property
+    def owner_id(self) -> str | None:
+        """The account's name as the server reported it (§C2.5), else ``None``.
+
+        Taken from the balance read, which is the read that carried it: this is
+        the server's value, and ``None`` means the server did not name this
+        account — nothing is invented here.
+        """
+        return self._owner_id
 
     @property
     def currency(self) -> str:

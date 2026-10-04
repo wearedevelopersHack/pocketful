@@ -167,3 +167,195 @@ already owns it. Redeclaring it makes `nginx -t` fail. Validate after any edit:
 ```sh
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+## T16 — shipped 2026-10-04: release `58466a7c`
+
+The T14/T15 revision (create-account, account switching, the demo notice) is live at
+`https://pocketful.getn.space/`. Recorded here because there is no version control on
+the host and this file is the history.
+
+### The two release-safety records plan §T16 owes
+
+1. **Open registration: ACCEPTED, not rate-limited.** Measured, not assumed — eight
+   rapid `POST /create` requests against the live URL returned
+   `303 303 303 303 303 303 303 303`, zero `429`. `grep -rn -i
+   "ratelimit\|throttle\|429" app/ api/` finds no limiter; the only `429` in the tree
+   is `app/client.py:42`, where the *client* treats an API `429` as retryable. So
+   anyone who can reach the page can mint accounts into the live database, at line
+   rate. Accepted for a play-money demo; flagged here so it is a decision, not an
+   oversight.
+2. **An account id is a bearer capability — for read *and* write.** There is no
+   authentication anywhere in this build. After rule 0 (one shared account resolver),
+   `GET /?account=<id>` returns that account's balance and full activity, and
+   `POST /send` with `account=<id>` spends from it. The ids are published: the boot
+   account's activity table renders counterparty ids on the public page, so anyone who
+   loads the demo can read the ids of every account the demo account has transacted
+   with, then read and spend from each. An id is the *only* credential and it is not a
+   secret. Accepted for this demo, and **stated on the page rather than left implicit**:
+   `DEMO_NOTICE` (`app/web.py:106`) is rendered by the single document assembler
+   (`_document`) — the only assembler the *application* uses. Measured live on the shipped
+   revision (2026-10-04): `/` → `200 text/html`, marker `1`; switched `/?account=<id>` →
+   marker `1`; unknown-account page → `200`, marker `1`.
+   **Correction, measured 2026-10-04 — the application does not own every HTML response.**
+   `PUT` / `DELETE` / `PATCH /` return `501 text/html;charset=utf-8` from
+   `BaseHTTPRequestHandler.send_error`, with `grep -c 'Unauthenticated demo'` → **0**; an
+   unrouted `POST /nonexistent` returns `404 application/json {"error":"not_found"}`. So
+   *"every `text/html` response carries the notice"* is **false on this revision**. The
+   markered set is "every document `_document` builds", not "every HTML response the server
+   emits". Recorded rather than smoothed over; the remediation is board **T19**
+   (`app/web.py` belongs to the frontend-engineer, not to `ops/`).
+
+### Ship evidence (2026-10-04)
+
+- Gate (planner's quoted run, pin re-cut independently here):
+  `GATE GREEN / exit 0`, `Ran 72 tests … OK`, phases 1–4, `63/63 checks passed`,
+  `TREE PIN (before) == (after) == 58466a7c292159db1cab3d4cca2748927eeef590c29b192c841256df9529a2ee`.
+- Staged bytes proven equal to the gated bytes before the swap: 3-tree pin
+  `7fe22cc63f5cfe238e90d9688349666742b1996dae4287f8d8f2c622e578fa4a` identical on dev and
+  host; `app/web.py` `02eaafddaab9af763bf093d7644c5a65364c22f471911497622840e170348e32`
+  identical on dev and host.
+- Before (what was live): `dc5e8b0b`, 3-tree pin
+  `b9a855ff0d8125af55b977af7cf7bf9054ac4f94b98350055c9bc0f9fddc14db`, `app/web.py`
+  `aa2ccccc95…`, 0 notice markers, `POST /create` → `404`.
+- After: 1 notice marker on `/`, `POST /create` → `303` (redirect to
+  `/?account=<new id>`), `GET /?account=<new id>` renders `Account <code><new id></code>`
+  and carries `name="account" value="<new id>"` on the send form, and the boot account
+  id appears 0 times — i.e. the page really switched.
+
+### Rollback, exercised — not just named
+
+Rollback target preserved as a byte copy at `/srv/pocketful/releases/dc5e8b0b.prev`
+before the swap (`cp -a /srv/pocketful/releases/dc5e8b0b …`, not `cp -a current …` —
+`current` is a symlink and `cp -a` would copy the link, not the tree).
+
+```sh
+ssh pocketful-prod "sudo ln -sfn /srv/pocketful/releases/dc5e8b0b.prev /srv/pocketful/current \
+                    && sudo systemctl restart pocketful-api pocketful-web"
+```
+
+Rehearsed this window: after the swap to `58466a7c`, this command reverted the live
+site to the old behaviour (0 notice markers, `POST /create` → `404`, `/` → `200`), both
+units `active`; the roll-forward
+`ln -sfn /srv/pocketful/releases/58466a7c …` restored the new behaviour. A rollback you
+have not run is not a rollback.
+
+### The store is state, and the swap did not touch it
+
+`/var/lib/pocketful/ui-pending.json` is service-level state, not per-release: its path
+is fixed in `pocketful-web.service` and the release tree is not its parent. Measured
+across the whole window — swap, rollback and roll-forward — the file was byte-identical
+at every point:
+
+```
+sha256  f3e2a029bb1b07ea577703c94599a0d8349a9fa1e761333420c10786a8c217c7
+618 bytes  mode 600  mtime 2026-10-02 13:54:52 +0000
+```
+
+The `mtime` is the load-bearing part: it predates the deploy window entirely, so
+neither restart so much as opened the file for write. Losing this file would make the
+next retry mint a fresh key, and a fresh key is a brand-new transfer arriving past
+every ledger invariant.
+
+### Edge / TLS — measured against the host on 2026-10-04
+
+`pocketful.getn.space` has its **own** nginx `server` block
+(`/etc/nginx/sites-available/pocketful.getn.space`) and its **own** certbot lineage
+(`/etc/letsencrypt/renewal/pocketful.getn.space.conf`, `authenticator = webroot`,
+expiry `2026-12-31 06:22:08+00:00`). The `getn.space` block is separate and was not
+touched. `certbot.timer` is `enabled`/`active`. The subdomain block proxies to
+`127.0.0.1:8080`; the ledger API stays on `127.0.0.1:8001`; port `8000` belongs to the
+other application. **This deploy changed no nginx config, no TLS, no DNS.**
+
+> Note recorded 2026-10-04: an earlier operator briefing asserted there was only one
+> certbot lineage and no subdomain `server` block. That is not what the host shows
+> today — the subdomain block and lineage were created `2026-10-02 07:20`. Measure the
+> topology; do not inherit it.
+
+### Post-ship divergence — measured, not predicted (2026-10-04) — **CLOSED** by the final ship below
+
+**The host still serves exactly the gated revision.** Measured after the record edits:
+
+```
+host /srv/pocketful/current 3-tree pin : 7fe22cc63f5cfe238e90d9688349666742b1996dae4287f8d8f2c622e578fa4a
+host app/web.py                        : 02eaafddaab9af763bf093d7644c5a65364c22f471911497622840e170348e32
+```
+
+Both equal the values staged and verified *before* the swap, so everything written since landed
+outside `/srv/pocketful/releases/58466a7c` — nothing has rewritten the release.
+
+**The dev working tree has moved**, during this window and not by `ops/`: `app/web.py` is now
+`686368f3bfe95fd3c03589b0510cc9420f969bd16553cd9f0907f61e0386772c` (was `02eaafdd…`) and
+`app/selfcheck.py` is now `79bb974477b5ea1e453083aeb4490bbfe0dc2521d785d1103b2decd90be9d957`.
+So the pins are now:
+
+| pin | shipped | now |
+|---|---|---|
+| 4-tree (gate) | `58466a7c…` | `aefd7e04dc998bd881c1b101ccbc050b65cc37c92e216450b164ae4a5bb4e9d3` |
+| 3-tree (release) | `7fe22cc6…` | `04c16b73699da3e52147be8f7b995b88ae94d6abfe2c0d6793df91cacbaf2f45` |
+
+`app/` is the released tree, so the live release `58466a7c` **no longer equals the working
+tree** — that is now a measurement, not the prediction it was an hour ago. T18's `tests/` half
+moves the gate pin only; the `app/` change above moves both.
+
+**Consequences, so the next operator does not rediscover them:**
+
+- The live site **is still the gate-certified revision.** The divergence is in the working tree,
+  not on the host — nothing here invalidated the deploy.
+- **Do not deploy for a docstring or a row label.** The next ship is a **new** revision with a
+  **new** pin, gated afresh from the settled tree — never a re-cut of `58466a7c`, and never a
+  copy of whatever the working tree happens to hold.
+- Rollback target unaffected: `/srv/pocketful/releases/dc5e8b0b.prev`.
+
+### Probe accounts left in the live DB by the T16 ship (disclosure)
+
+`POST /create` is the DoD's own probe, so the ship necessarily minted accounts. All are
+play-money demo accounts, zero balance, no keys:
+
+- this ship: `probe`, `t16probe` (`fe9434dedb524a4da68c692810f89443`),
+  `ratelimit-probe-1` … `ratelimit-probe-8`
+- the planner's independent verification probe: `planner-probe-4`
+  (`0e3352cd92ae4ce8842549b3f9a803bc`)
+- the final ship: `final-ship-probe`, `rollback-rehearsal-probe`
+
+### Final ship 2026-10-04 — divergence CLOSED at `6c766987`
+
+T18 and T19 landed, so the tree moved onto the corrections and the site was shipped onto it. Site
+and tree now agree.
+
+| | revision |
+|---|---|
+| 4-tree gate pin | `58466a7c…` → **`6c766987d2cb2909be91bff5cdb9b8e342386104da83038693cedf8267ef4d73`** |
+| 3-tree release pin | `7fe22cc6…` → **`04c16b73699da3e52147be8f7b995b88ae94d6abfe2c0d6793df91cacbaf2f45`** |
+| `app/web.py` | `02eaafdd…` → **`686368f3bfe95fd3c03589b0510cc9420f969bd16553cd9f0907f61e0386772c`** |
+| release dir | `58466a7c` → **`6c766987`** (named for the new pin, never a re-cut) |
+| armed rollback | **`/srv/pocketful/releases/58466a7c.prev`** (byte copy of the previous live release, pin `7fe22cc6…`) |
+
+- Gate, **run by the deploy-engineer** on the settled tree: exit 0, `GATE GREEN`; 1/4
+  `Ran 72 tests in 13.088s … OK`; 2/4 compile clean; 3/4 `lint: checked 21 modules … clean`;
+  4/4 `63/63 checks passed`; `TREE PIN (before) == (after) == 6c766987…`.
+- **The gate log contains 15 `FAIL` rows and is still green.** That is not a contradiction and it
+  must not be judged by `grep -c FAIL`: `run_gate.sh` records each phase's `$?` into `STATUS` and
+  exits 0 only if all four returned 0, and the rows come from the suite's deliberate mutant
+  drivers (the never-records-keys ledger, `test_the_mutant_only_disturbs_rows_downstream_of_a_refusal`,
+  the mutated-notice-wrapper witness). Read the criterion out of the script; do not apply a
+  remembered rule about it.
+- Staged bytes proven equal to the gated bytes **before** the pointer moved: 3-tree pin and
+  `app/web.py` digest identical dev vs host.
+- Live after: `GET /` → `200 text/html`, notice markers `1`; `POST /create` → `303`;
+  **served `app/web.py` digest == the tree's `686368f3…`** — the point of the ship.
+- Rollback **rehearsed against the new target**: `current → 58466a7c.prev` served the old bytes
+  (`app/web.py 02eaafdd…`) with both units `active`; the roll-forward restored `686368f3…`.
+- Store `/var/lib/pocketful/ui-pending.json` **unchanged across the whole window** — swap, revert
+  and roll-forward — at digest `470590c509a063f6193a7362333be2b57e01b3a5dea5d13e91c2edba68585001`,
+  892 bytes, mode 600, **mtime `2026-10-04 08:34:35`**, which predates the window.
+
+**One observation worth keeping, because it looks like a defect and is not.** At the T16 ship the
+store was 618 bytes / mtime `2026-10-02 13:54:52`; by the time this ship's baseline was taken it was
+892 bytes / mtime `2026-10-04 08:34:35`, and `pocketful.db` had been written a minute earlier. That
+change happened **before** this window opened and was not caused by the gate or by any test:
+nothing outside `ops/` references the live paths (tests build their store under `TemporaryDirectory`;
+`app/web.py` defaults `--store` to a *relative* path), and `run_gate.sh` writes only a throwaway
+fixture under `TMPDIR`. The coherent explanation is **live traffic through the public site** — a
+send writes the ledger and mints a pending key. That is the application working, and the store
+holding a pending record is exactly the state the T16 rehearsal proved survives both a swap and a
+revert. **No boot step may clean it up.**

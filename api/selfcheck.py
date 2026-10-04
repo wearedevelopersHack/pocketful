@@ -43,11 +43,16 @@ READY_TIMEOUT_SECONDS = 10.0
 RESULTS: list[tuple[bool, str]] = []
 
 ACCOUNT_KEYS = {"account_id", "owner_id", "currency", "balance_minor", "allow_overdraft"}
-BALANCE_KEYS = {"account_id", "currency", "balance_minor"}
+# §C2.5: the balance read carries the owner. This constant was defined and never
+# referenced — the pin was the literal dict in the balance row, so widening the
+# body would have sailed straight past it. It is referenced now.
+BALANCE_KEYS = {"account_id", "owner_id", "currency", "balance_minor"}
 TRANSFER_KEYS = {"transfer_id", "status", "from_account_id", "to_account_id",
                  "amount_minor", "currency", "created_at"}
+# §C2.5: the counterparty's owner rides BESIDE its id, never instead of it.
 ACTIVITY_ITEM_KEYS = {"entry_id", "transfer_id", "direction", "amount_minor",
-                      "balance_after_minor", "counterparty_account_id", "created_at"}
+                      "balance_after_minor", "counterparty_account_id",
+                      "counterparty_owner_id", "created_at"}
 
 
 def check(ok: bool, label: str, detail: str = "") -> bool:
@@ -141,6 +146,25 @@ def is_minor(value: object) -> bool:
     return type(value) is int
 
 
+def _counts(db_path: str) -> tuple[int, int, int]:
+    """``(transfers, idempotency_keys, ledger_entries)`` read off the real file.
+
+    Counting is done as a DELTA around a block of requests, never as an absolute:
+    every granted USD account adds a transfer and two entries of its own (§C2.3),
+    so an absolute count would pin the grant policy rather than the claim the row
+    is making ("this refusal wrote nothing").
+    """
+    conn = connect(db_path)
+    try:
+        return (
+            conn.execute("SELECT COUNT(*) FROM transfers").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM idempotency_keys").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM ledger_entries").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
 def post_transfer(client: Client, body: dict, key: str | None) -> tuple[int, object]:
     headers = {"Idempotency-Key": key} if key is not None else {}
     return client.call("POST", "/transfers", body, headers=headers)
@@ -154,34 +178,66 @@ def run(client: Client, db_path: str) -> None:
     check(status == 201 and isinstance(body, dict) and set(body) == ACCOUNT_KEYS,
           "POST /accounts -> 201 with exactly the §2.2 body", f"{status} {body}")
     check(isinstance(body, dict) and is_minor(body.get("balance_minor"))
-          and body["balance_minor"] == 0
+          and body["balance_minor"] == 10_000
           and body.get("account_id") == "acct-alice"
           and body.get("currency") == "USD" and body.get("allow_overdraft") is False,
-          "new account: id echoed, currency USD, balance_minor 0, overdraft false",
+          "new USD account opens WITH the §C2.3 opening grant: balance_minor 10000",
           f"{body}")
 
+    # §C2.2 + §C2.4: the account_id IS the natural idempotency key, and a repeat
+    # is REJECTED rather than replayed. The clause that carries the money meaning
+    # is the second one — the refusal must not have posted a SECOND grant.
     status, body = client.call("POST", "/accounts",
                                {"owner_id": "alice", "currency": "USD",
                                 "account_id": "acct-alice"})
     check(status == 409 and body == {"error": "account_exists"},
           "re-open an existing id -> 409 account_exists (not idempotent)",
           f"{status} {body}")
+    status, alice_after_dup = client.call("GET", "/accounts/acct-alice/balance")
+    check(isinstance(alice_after_dup, dict)
+          and alice_after_dup.get("balance_minor") == 10_000,
+          "the duplicate create posted NO second grant (alice still 10000)",
+          f"{alice_after_dup}")
 
-    status, body = client.call("POST", "/accounts", {"owner_id": "carol", "currency": "USD"})
-    generated = body.get("account_id") if isinstance(body, dict) else None
-    check(status == 201 and isinstance(generated, str) and len(generated) == 32,
-          "account_id is server-generated when the body omits it", f"{status} {generated}")
+    # §C2.1: the id is REQUIRED and client-supplied — the server never mints one.
+    # This is the whole of the free-money hole: with a minted id, a retry after an
+    # unknown outcome opens a SECOND account carrying a SECOND $100.
+    for extra, label in (
+        ({}, "absent"),
+        ({"account_id": None}, "null"),
+        ({"account_id": ""}, "empty"),
+        ({"account_id": "   "}, "whitespace-only"),
+    ):
+        status, body = client.call("POST", "/accounts",
+                                   {"owner_id": "nobody", "currency": "USD", **extra})
+        check(status == 400 and body == {"error": "invalid_request"},
+              f"account_id {label} -> 400 invalid_request, nothing created "
+              f"(the server never mints one)", f"{status} {body}")
+
+    # §C1.7: the reserved id names the system account and can never become a
+    # caller's. A 4xx — a 500 here would report a policy refusal as a crash and
+    # let a client tell the two apart.
+    status, body = client.call("POST", "/accounts",
+                               {"owner_id": "attacker", "currency": "USD",
+                                "account_id": "__system__"})
+    check(status == 409 and body == {"error": "reserved_account_id"},
+          "account_id '__system__' -> 409 reserved_account_id (never 2xx, never 500)",
+          f"{status} {body}")
 
     status, body = client.call("POST", "/accounts", raw_body=b"{not json",
                                headers={"Content-Type": "application/json"})
     check(status == 400 and body == {"error": "malformed_json"},
           "malformed JSON body -> 400 malformed_json", f"{status} {body}")
 
-    status, body = client.call("POST", "/accounts", {"owner_id": "x", "currency": "usd"})
+    status, body = client.call("POST", "/accounts",
+                               {"owner_id": "x", "currency": "usd",
+                                "account_id": "acct-lower"})
     check(status == 400 and body == {"error": "invalid_request"},
           "lowercase currency -> 400 invalid_request (not coerced)", f"{status} {body}")
 
-    status, body = client.call("POST", "/accounts", {"owner_id": 7, "currency": "USD"})
+    status, body = client.call("POST", "/accounts",
+                               {"owner_id": 7, "currency": "USD",
+                                "account_id": "acct-bad-owner"})
     check(status == 400 and body == {"error": "invalid_request"},
           "non-string owner_id -> 400 invalid_request", f"{status} {body}")
 
@@ -193,21 +249,34 @@ def run(client: Client, db_path: str) -> None:
                                     "account_id": account_id, "allow_overdraft": overdraft})
         check(status == 201, f"create {account_id} ({currency})", f"{status} {body}")
 
+    # The grant is USD-only, because the system account it posts against is
+    # single-currency (§C1.2, INVARIANTS §1). A non-USD account still OPENS —
+    # what is restricted is the grant, not the generality of creation.
+    status, eur = client.call("GET", "/accounts/acct-eur/balance")
+    check(isinstance(eur, dict) and is_minor(eur.get("balance_minor"))
+          and eur.get("balance_minor") == 0 and eur.get("currency") == "EUR",
+          "a non-USD account still opens, ungranted, at 0 (creation is not refused)",
+          f"{eur}")
+
     status, body = client.call("GET", "/accounts/acct-alice/balance")
-    check(status == 200 and body == {"account_id": "acct-alice", "currency": "USD",
-                                     "balance_minor": 0}
+    check(status == 200 and isinstance(body, dict) and set(body) == BALANCE_KEYS
+          and body == {"account_id": "acct-alice", "owner_id": "alice",
+                       "currency": "USD", "balance_minor": 10_000}
           and is_minor(body["balance_minor"]),
-          "GET balance -> 200 with exactly the §2.2 body", f"{status} {body}")
+          "GET balance -> 200 with exactly the §C2.5 body (owner_id on the read path)",
+          f"{status} {body}")
 
     status, body = client.call("GET", "/accounts/ghost/balance")
     check(status == 404 and body == {"error": "unknown_account"},
           "GET balance of an unknown account -> 404 unknown_account", f"{status} {body}")
 
     # Fund alice from an overdraft-enabled account so the validation rejections
-    # below are never rejected for lack of funds.
+    # below are never rejected for lack of funds — and so the payer actually
+    # crosses zero. The grant gives acct-mint 10000; sending 11000 leaves it at
+    # -1000, which is what puts a NEGATIVE balance_after on the wire below.
     status, body = client.call("POST", "/transfers",
                                {"from_account_id": "acct-mint", "to_account_id": "acct-alice",
-                                "amount_minor": 1000, "currency": "USD"},
+                                "amount_minor": 11_000, "currency": "USD"},
                                headers={"Idempotency-Key": "K-fund"})
     check(status == 201 and isinstance(body, dict) and body.get("status") == "applied",
           "funding transfer (overdraft payer) -> 201 applied", f"{status} {body}")
@@ -245,10 +314,15 @@ def run(client: Client, db_path: str) -> None:
               f"amount_minor {label} -> 422 invalid_amount", f"{status} {body}")
 
     # A rejected body must never have reached the ledger: alice is untouched.
+    # 21000 = the 10000 opening grant + the 11000 funding transfer.
     status, body = client.call("GET", "/accounts/acct-alice/balance")
     check(isinstance(body, dict) and is_minor(body.get("balance_minor"))
-          and body.get("balance_minor") == 1000,
-          "no rejected body reached the ledger (alice still 1000)", f"{body}")
+          and body.get("balance_minor") == 21_000,
+          "no rejected body reached the ledger (alice still 21000)", f"{body}")
+
+    # Snapshot before the one transfer that is meant to land, so the database
+    # block below can assert a DELTA rather than an absolute count.
+    before_counts = _counts(db_path)
 
     # ---- idempotency -------------------------------------------------------
     good = dict(base)
@@ -274,10 +348,11 @@ def run(client: Client, db_path: str) -> None:
     status, alice = client.call("GET", "/accounts/acct-alice/balance")
     status2, bob = client.call("GET", "/accounts/acct-bob/balance")
     check(isinstance(alice, dict) and is_minor(alice.get("balance_minor"))
-          and alice.get("balance_minor") == 500
+          and alice.get("balance_minor") == 20_500
           and isinstance(bob, dict) and is_minor(bob.get("balance_minor"))
-          and bob.get("balance_minor") == 500,
-          "the conflicting body was not applied (alice 500, bob 500)",
+          and bob.get("balance_minor") == 10_500,
+          "the conflicting body was not applied (alice 10000+11000-500=20500, "
+          "bob 10000+500=10500)",
           f"{alice} {bob}")
 
     # ---- honest failures ---------------------------------------------------
@@ -306,46 +381,85 @@ def run(client: Client, db_path: str) -> None:
     check(status == 404 and body == {"error": "unknown_account"},
           "unknown payee -> 404 unknown_account", f"{status} {body}")
 
+    # §C1.8: the system account carries allow_overdraft so grants can debit it
+    # without limit. A client-facing transfer touching it would therefore be a
+    # mint of any amount, so BOTH ends are refused. The status matters as much as
+    # the refusal: a 500 would report a policy refusal as a crash and let a caller
+    # tell the two apart, while the grant itself would be decorative.
+    for money_in, money_out in (("__system__", "acct-bob"), ("acct-alice", "__system__")):
+        status, body = post_transfer(
+            client,
+            {"from_account_id": money_in, "to_account_id": money_out,
+             "amount_minor": 10, "currency": "USD"},
+            f"K-sys-{money_in}")
+        check(status == 422 and body == {"error": "system_account_transfer"},
+              f"transfer with __system__ as the {'payer' if money_in == '__system__' else 'payee'}"
+              f" -> 422 system_account_transfer (never 2xx, never 500)",
+              f"{status} {body}")
+
     # ---- activity: the uniform non-negative wire rule ----------------------
     status, body = client.call("GET", "/accounts/acct-alice/activity")
     items = body.get("items") if isinstance(body, dict) else None
-    check(status == 200 and isinstance(items, list) and len(items) == 2
+    check(status == 200 and isinstance(items, list) and len(items) == 3
           and body.get("next_cursor") is None,
-          "GET activity -> 200, newest first, null cursor on a partial page",
+          "GET activity -> 200, newest first, null cursor on a partial page "
+          "(grant credit + funding credit + the one debit)",
           f"{status} {body}")
     check(bool(items) and all(isinstance(item, dict) and set(item) == ACTIVITY_ITEM_KEYS
                               for item in items),
-          "every activity item has exactly the §2.2 shape", f"{items}")
+          "every activity item has exactly the §C2.5 shape", f"{items}")
     check(bool(items) and all(is_minor(item["amount_minor"])
                               and item["amount_minor"] >= 0 for item in items),
           "every activity amount_minor is a NON-NEGATIVE integer", f"{items}")
     check(bool(items) and all(item["direction"] in ("debit", "credit") for item in items),
           "direction is explicitly debit or credit", f"{items}")
 
+    # §C2.5 evidence: the owner is ON the wire, so the page prints the name it is
+    # handed instead of holding an id→name map of its own.
+    check(bool(items) and all(isinstance(item.get("counterparty_owner_id"), str)
+                              and item["counterparty_owner_id"].strip()
+                              for item in items),
+          "every activity item names its counterparty's OWNER (§C2.5 read path)",
+          f"{items}")
+
+    # The grant shows up as ONE credit from the named system account — a real
+    # balanced double entry, not value appearing from nowhere (§C1.3).
+    grants = [item for item in items or []
+              if item.get("counterparty_account_id") == "__system__"]
+    check(len(grants) == 1 and grants[0]["direction"] == "credit"
+          and grants[0]["amount_minor"] == 10_000,
+          "the opening grant is one credit from the named system account",
+          f"{grants}")
+
     debits = [item for item in items or [] if item.get("direction") == "debit"]
     check(len(debits) == 1 and debits[0]["amount_minor"] == 500
           and debits[0]["counterparty_account_id"] == "acct-bob"
-          and debits[0]["balance_after_minor"] == 500,
+          and debits[0]["counterparty_owner_id"] == "acct-bob"
+          and debits[0]["balance_after_minor"] == 20_500,
           "alice's debit shows +500 under direction=debit (sign never on the wire)",
           f"{debits}")
 
     status, bob_activity = client.call("GET", "/accounts/acct-bob/activity")
     bob_items = bob_activity.get("items") if isinstance(bob_activity, dict) else []
-    credits = [item for item in bob_items or [] if item.get("direction") == "credit"]
-    check(status == 200 and len(credits) == 1 and credits[0]["amount_minor"] == 500
-          and credits[0]["counterparty_account_id"] == "acct-alice",
-          "bob's credit shows +500 under direction=credit", f"{credits}")
+    from_alice = [item for item in bob_items or []
+                  if item.get("counterparty_account_id") == "acct-alice"]
+    check(status == 200 and len(from_alice) == 1 and from_alice[0]["amount_minor"] == 500
+          and from_alice[0]["direction"] == "credit"
+          and from_alice[0]["counterparty_owner_id"] == "alice",
+          "bob's credit from alice: +500 under direction=credit, counterparty owner named",
+          f"{from_alice}")
 
     status, mint_activity = client.call("GET", "/accounts/acct-mint/activity")
     mint_items = mint_activity.get("items") if isinstance(mint_activity, dict) else []
-    check(status == 200 and len(mint_items) == 1
-          and mint_items[0]["direction"] == "debit"
-          and is_minor(mint_items[0]["amount_minor"])
-          and mint_items[0]["amount_minor"] == 1000
-          and is_minor(mint_items[0]["balance_after_minor"])
-          and mint_items[0]["balance_after_minor"] == -1000,
-          "an overdraft payer's debit is +1000 amount_minor with a NEGATIVE balance_after",
-          f"{mint_items}")
+    mint_debits = [item for item in mint_items or [] if item.get("direction") == "debit"]
+    check(status == 200 and len(mint_debits) == 1
+          and is_minor(mint_debits[0]["amount_minor"])
+          and mint_debits[0]["amount_minor"] == 11_000
+          and is_minor(mint_debits[0]["balance_after_minor"])
+          and mint_debits[0]["balance_after_minor"] == -1_000,
+          "an overdraft payer's debit is +11000 amount_minor with a NEGATIVE "
+          "balance_after (10000 grant - 11000) — the sign never leaves the wire",
+          f"{mint_debits}")
 
     status, page = client.call("GET", "/accounts/acct-alice/activity?limit=1")
     page_items = page.get("items") if isinstance(page, dict) else []
@@ -382,19 +496,24 @@ def run(client: Client, db_path: str) -> None:
           "unknown route -> 404 not_found", f"{status} {body}")
 
     # ---- database truth: the failed and conflicting attempts wrote nothing --
-    conn = connect(db_path)
-    try:
-        transfers = conn.execute("SELECT COUNT(*) FROM transfers").fetchone()[0]
-        keys = conn.execute("SELECT COUNT(*) FROM idempotency_keys").fetchone()[0]
-        entries = conn.execute("SELECT COUNT(*) FROM ledger_entries").fetchone()[0]
-    finally:
-        conn.close()
-    check(transfers == 2, "exactly 2 transfers exist (replay wrote none, conflict wrote none)",
-          f"transfers={transfers}")
-    check(keys == 2, "exactly 2 idempotency rows exist (failures and conflicts wrote none)",
-          f"idempotency_keys={keys}")
-    check(entries == 4, "double entry holds: 2 transfers x 2 entries",
-          f"ledger_entries={entries}")
+    #
+    # A DELTA around the block, not an absolute count: every granted USD account
+    # adds a transfer and two entries of its own (§C2.3), so an absolute number
+    # would pin the grant policy rather than the claim this row is making. The
+    # claim is that exactly ONE transfer and ONE key landed — K1 — and that the
+    # replay, the conflict and the refusals above added nothing on top of the
+    # snapshot taken before K1.
+    transfers, keys, entries = _counts(db_path)
+    check(transfers == before_counts[0] + 1,
+          "exactly one transfer landed across the idempotency and refusal blocks "
+          "(replay, conflict and refusals wrote none)",
+          f"transfers {before_counts[0]} -> {transfers}")
+    check(keys == before_counts[1] + 1,
+          "exactly one idempotency row landed (refusals and conflicts wrote none)",
+          f"idempotency_keys {before_counts[1]} -> {keys}")
+    check(entries == before_counts[2] + 2,
+          "double entry holds: the one landed transfer wrote exactly two entries",
+          f"ledger_entries {before_counts[2]} -> {entries}")
 
     # ---- a refused transfer must not burn its key ---------------------------
     #
@@ -424,8 +543,12 @@ def run(client: Client, db_path: str) -> None:
                                headers={"Idempotency-Key": "K-rk-fund"})
     check(status == 201, "fund the refused-retry payer with 300", f"{status} {body}")
 
+    # The refused body must be one the payer genuinely cannot afford. Every USD
+    # account now opens with a 10000 grant (§C2.3), so "unaffordable" is 11000
+    # against the payer's 10000 + 300 funding — not the 1000 that was
+    # unaffordable when a new account still started at 0.
     unaffordable = {"from_account_id": "acct-rk-payer", "to_account_id": "acct-rk-payee",
-                    "amount_minor": 1000, "currency": "USD"}
+                    "amount_minor": 11_000, "currency": "USD"}
     affordable = dict(unaffordable, amount_minor=250)
 
     status, body = post_transfer(client, unaffordable, "K-rk")
@@ -480,11 +603,11 @@ def run(client: Client, db_path: str) -> None:
     status, rk_payer = client.call("GET", "/accounts/acct-rk-payer/balance")
     status2, rk_payee = client.call("GET", "/accounts/acct-rk-payee/balance")
     check(isinstance(rk_payer, dict) and is_minor(rk_payer.get("balance_minor"))
-          and rk_payer.get("balance_minor") == 50
+          and rk_payer.get("balance_minor") == 10_050
           and isinstance(rk_payee, dict) and is_minor(rk_payee.get("balance_minor"))
-          and rk_payee.get("balance_minor") == 250,
-          "exactly one application under K-rk: payer 300-250=50, payee 250, "
-          "the refusal and the conflict moved nothing",
+          and rk_payee.get("balance_minor") == 10_250,
+          "exactly one application under K-rk: payer 10000+300-250=10050, "
+          "payee 10000+250=10250, the refusal and the conflict moved nothing",
           f"{rk_payer} {rk_payee}")
 
     conn = connect(db_path)
@@ -522,6 +645,10 @@ def run_concurrency(client: Client) -> None:
     connection pool neither serializes into failures nor shares one connection
     across threads, and that the balance read that feeds the write stays inside
     the ledger's transaction.
+
+    The payer's balance is reached by DRAINING it, not by funding it: every USD
+    account now opens with a 10000 opening grant (§C2.3), so the scenario funds
+    itself and then spends down to the exact 100 the storm needs.
     """
     workers = 30
     client.call("POST", "/accounts", {"owner_id": "storm", "currency": "USD",
@@ -531,10 +658,12 @@ def run_concurrency(client: Client) -> None:
     for index in range(10):
         client.call("POST", "/accounts", {"owner_id": f"q{index}", "currency": "USD",
                                           "account_id": f"q{index}"})
+    # 10000 (the opening grant) - 9900 (drained to the storm account) = 100, which
+    # is exactly ten 10-minor transfers.
     client.call("POST", "/transfers",
-                {"from_account_id": "acct-storm", "to_account_id": "acct-payer",
-                 "amount_minor": 100, "currency": "USD"},
-                headers={"Idempotency-Key": "storm-fund"})
+                {"from_account_id": "acct-payer", "to_account_id": "acct-storm",
+                 "amount_minor": 9_900, "currency": "USD"},
+                headers={"Idempotency-Key": "storm-drain"})
 
     statuses: list[tuple[int, str]] = []
     lock = threading.Lock()
@@ -583,10 +712,11 @@ def run_concurrency(client: Client) -> None:
 
     status, activity = client.call("GET", "/accounts/acct-payer/activity?limit=200")
     items = activity.get("items") if isinstance(activity, dict) else []
-    check(status == 200 and len(items) == 11
-          and sum(1 for item in items if item["direction"] == "debit") == 10
+    check(status == 200 and len(items) == 12
+          and sum(1 for item in items if item["direction"] == "debit") == 11
           and all(item["amount_minor"] >= 0 for item in items),
-          "the storm wrote 10 non-negative debits plus its one funding credit",
+          "the storm wrote 10 non-negative debits, atop the payer's grant credit "
+          "and the one drain debit",
           f"items={len(items)}")
 
 

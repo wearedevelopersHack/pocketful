@@ -64,7 +64,17 @@ class ApiClient:
         except urllib.error.HTTPError as exc:
             # A refusal is an answer, not a transport failure: keep the status
             # and body so the caller can branch on the server's error code.
-            return exc.code, exc.read()
+            #
+            # Closed explicitly, like the success path above. An unclosed
+            # HTTPError keeps its buffered response until GC and then reports a
+            # ResourceWarning; that warning channel is the only evidence of a
+            # genuinely unclosed resource elsewhere (the pool's sqlite
+            # connections were one), so a warning that is always there is a
+            # warning nobody reads.
+            try:
+                return exc.code, exc.read()
+            finally:
+                exc.close()
 
     def _request(self, method: str, path: str, body: object = None,
                  headers: dict[str, str] | None = None) -> dict:

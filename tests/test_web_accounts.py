@@ -85,6 +85,7 @@ from app.keystore import PendingStore
 from app.wallet import Wallet
 import app.web as app_web
 
+from ledger import OPENING_GRANT_MINOR, SYSTEM_ACCOUNT_ID
 from tests.invariants import assert_i1, assert_i2, entry_count, idempotency_row_count
 
 BOOT = "acct-t14-boot"          # the boot --account
@@ -111,7 +112,22 @@ _HIDDEN_ACCOUNT = re.compile(r"<input\b[^>]*\bname=(?:\"account\"|'account')[^>]
 # ``assertIn(other_id, page)`` is satisfied by an activity row's counterparty or
 # by the payee of a pending transfer — this file's first draft went green on the
 # broken tree exactly that way, with the id arriving from the pending block.
-_ACCOUNT_LABEL = re.compile(r"Account\s*<code>([^<]+)</code>", re.I)
+_ACCOUNT_LABEL = re.compile(r'<code class="addr"[^>]*>([^<]+)</code>', re.I)
+"""Read from the element that carries the address (``app/design.py``'s
+``wallet_header``): ``<code class="addr" title="Account ID">…</code>``. Re-cut
+2026-10-04 with the redesign, which moved the address out of the old
+``Account <code>…</code>`` line; the subject is unchanged — the element that says
+which account this page is showing, not any id that happens to appear."""
+
+# The balance the page displays, read from the element that carries it. Same
+# reason as _ACCOUNT_LABEL: a bare ``assertIn("$100.00", page)`` can be satisfied
+# by a figure in the activity feed or the send form, which is not "the page shows
+# this account's balance".
+_BALANCE = re.compile(r'<p class="balance">(?:<span[^>]*></span>)?\s*([^<]*)</p>')
+"""Re-cut 2026-10-04: the element is now ``<p class="balance">`` and carries an
+empty ``<span class="cur">`` before the figure (the class hook the stylesheet
+targets, emitted with ``aria-hidden``), so the reader skips the span rather than
+the whole element being renamed away."""
 
 
 def _import_api():
@@ -144,10 +160,16 @@ def _wait_until_answering(port, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1)
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/accounts/nobody/balance", timeout=1):
+                pass
             return
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            # An HTTPError wraps the response fp (urllib's addbase subclasses
+            # tempfile._TemporaryFileWrapper); leaving it unclosed defers the
+            # close to GC and emits a ResourceWarning. Close it here so the
+            # warning channel stays meaningful.
+            exc.close()
             return
         except OSError:
             time.sleep(0.02)
@@ -189,7 +211,10 @@ def _request(port, method, path, form=None):
         with opener.open(request, timeout=10) as response:
             return response.status, dict(response.headers), response.read().decode()
     except urllib.error.HTTPError as exc:
-        return exc.code, dict(exc.headers), exc.read().decode()
+        try:
+            return exc.code, dict(exc.headers), exc.read().decode()
+        finally:
+            exc.close()  # see _wait_until_answering: unclosed -> ResourceWarning
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -206,8 +231,18 @@ def _active_account(page):
     match = _ACCOUNT_LABEL.search(page)
     if match is None:
         raise AssertionError(
-            "the page names no active account (no `Account <code>` element), so it "
-            "cannot be shown to be rendering the requested one")
+            "the page names no active account (no `<code class=\"addr\">` element), "
+            "so it cannot be shown to be rendering the requested one")
+    return match.group(1)
+
+
+def _balance_text(page):
+    """The money the page displays, or a loud failure. See ``_BALANCE``."""
+    match = _BALANCE.search(page)
+    if match is None:
+        raise AssertionError(
+            "the page renders no balance element (`<div class=\"balance\">`), so "
+            "the figure on it cannot be attributed to the account it names")
     return match.group(1)
 
 
@@ -231,7 +266,45 @@ class RecordingTransport:
             with urllib.request.urlopen(request, timeout=10) as response:
                 return response.status, response.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            try:
+                return exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
+
+
+class _SubstitutedBalance:
+    """Real HTTP, except one account's balance read answers with a substitute.
+
+    The point is not to break the API — every other request, including the create
+    itself and the activity read that follows it, goes over the real wire. It is
+    to make the *server* say a number nobody could have guessed from the request,
+    so "the page shows $100.00" can be told apart from "the page echoes the
+    server". A renderer that prints the grant (or any constant) shows the same
+    figure either way; only a renderer that reads the answer follows.
+    """
+
+    def __init__(self, account_id, balance_minor, currency="USD"):
+        self.account_id = account_id
+        self.balance_minor = balance_minor
+        self.currency = currency
+
+    def __call__(self, method, url, body, headers):
+        if (method == "GET"
+                and urlsplit(url).path == f"/accounts/{self.account_id}/balance"):
+            return 200, json.dumps({
+                "account_id": self.account_id,
+                "balance_minor": self.balance_minor,
+                "currency": self.currency,
+            }).encode("utf-8")
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
 
 
 # -- the disclosure row and its falsifier --------------------------------------
@@ -285,18 +358,27 @@ def _documents_missing_the_notice(port, paths):
 
 # -- the pending item names its sender -----------------------------------------
 
-_REAL_PENDING_BLOCK = app_web._pending_block
+_REAL_PENDING_BLOCK = app_web.pending_block
 """Captured for the same reason as ``_REAL_DOCUMENT``: the mutant must not reach
-the behaviour it replaced through the name that now points at the mutant."""
+the behaviour it replaced through the name that now points at the mutant.
+
+Renamed with the renderer (frontend-engineer, 2026-10-04): the component moved to
+``app/design.py`` and ``app/web.py`` now imports it as ``pending_block``. The
+seam is unchanged in kind — ``app/web.py`` still looks the name up on its own
+module at call time, so rebinding ``app_web.pending_block`` still substitutes the
+renderer for the whole page."""
 
 
 def _pending_block_without_the_sender(pending):
     """MUTANT: the renderer as it was before T18's fix — the sender named nowhere.
 
-    ``app/web.py`` rendered each unconfirmed transfer as
-    ``send <amount> to <to_account_id> (not confirmed)``, so on B's page a record
-    whose ``from_account_id`` is A read as B's own: the page implied, rather than
-    said, who was sending. The fix added ``from <from_account_id>``.
+    The defect is unchanged by the redesign: the item named only the payee, so on
+    B's page a record whose ``from_account_id`` is A read as B's own. The *shape*
+    the reconstruction removes changed with the component (``app/design.py``):
+    the pre-redesign ``app/web.py`` item read
+    ``send <amount> to <to_account_id> (not confirmed)`` and the fix added
+    ``from <from_account_id>``; the component now renders ``<sender> → <payee>``
+    in one span, so the sender is dropped from there.
 
     Shape, and it is the rule this file now follows for every mutant: **call the
     object captured before the rebinding, never the attribute you rebound.** This
@@ -306,13 +388,14 @@ def _pending_block_without_the_sender(pending):
     the mutant introduced.
 
     This is a **reconstruction** (there is no version control on this machine, so
-    the pre-fix bytes are gone): it strips exactly the `` from <id>`` phrase the
-    fix added, which is what the pre-fix f-string produced for the same record.
-    Faithfulness here is a reviewer's judgment item, not the author's.
+    the pre-redesign bytes are gone): faithfulness is a reviewer's judgment item,
+    not the author's. The row below asserts the mutant actually rendered and that
+    the sender really is gone, so an inert mutant reports as a failure rather than
+    as a pass.
     """
-    html = _REAL_PENDING_BLOCK(pending)
+    html = _REAL_PENDING_BLOCK(pending=pending)
     for rec in pending:
-        html = html.replace(f" from {rec.from_account_id}", "")
+        html = html.replace(f"{rec.from_account_id} → ", "")
     return html
 
 
@@ -328,7 +411,12 @@ def _pending_items(page):
     items = []
     for chunk in re.split(r"<li>", page)[1:]:
         item = chunk.split("</li>", 1)[0]
-        if "not confirmed" in item.lower():
+        # The pending item's shape after the redesign (app/design.py): one <li>
+        # carrying amount, who and when spans. Activity rows are <tr>, so this
+        # cannot pick up a settled row; the old discriminator was the phrase
+        # "(not confirmed)", which the component now says once outside the list.
+        if all(marker in item for marker in ('class="amt"', 'class="who"',
+                                             'class="when"')):
             items.append(item)
     return items
 
@@ -411,7 +499,12 @@ class AccountsAndSwitching(unittest.TestCase):
         return PendingStore(self.store_path).all_records()
 
     def _ledger(self, db_path):
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # ``with sqlite3.connect(...) as conn`` commits a transaction but does
+        # NOT close the connection — sqlite3's context manager is not a file
+        # closer. Wrapping in closing() makes the ``with ... as conn`` at the
+        # call sites actually close, instead of leaking to GC (ResourceWarning).
+        return contextlib.closing(
+            sqlite3.connect(f"file:{db_path}?mode=ro", uri=True))
 
     # -- 1. create-account mints no key and moves no money ---------------------
 
@@ -445,21 +538,40 @@ class AccountsAndSwitching(unittest.TestCase):
                                  f"the 303 target must be a GET that answers 200; got {follow}")
                 self.assertEqual(_active_account(page), NEW,
                                  "the page landed on must be showing the new account")
+                # T20: and it shows the new account's MONEY, taken from the
+                # server — a page landed on after a create that still displayed
+                # the boot account's balance would be showing the wrong account's
+                # money while naming the right one.
+                self.assertEqual(_balance_text(page), "$100.00",
+                                 "the landed-on page must show the new account's "
+                                 "opening grant, rendered from 10000 minor units")
 
-            # It really exists at the API, and it is empty: balance 0, no activity.
-            self.assertEqual(self._balance(base, NEW), 0,
-                             "a brand-new account's derived balance must be 0")
-            self.assertEqual(ApiClient(base).list_activity(NEW)["items"], [],
-                             "a brand-new account must have no ledger activity")
-            # ... and nothing moved: the funder is untouched, and so is the ledger.
+            # T20: creating a USD account mints a BALANCED opening grant from the
+            # named __system__ account. So the row's name still holds — nothing is
+            # minted and I1/I2 below are untouched — but the derived balance is the
+            # grant, not 0, and the account now has exactly one activity row: it.
+            self.assertEqual(self._balance(base, NEW), OPENING_GRANT_MINOR,
+                             "a brand-new account's balance is the opening grant "
+                             "minted from __system__, not 0")
+            activity = ApiClient(base).list_activity(NEW)["items"]
+            self.assertEqual(len(activity), 1,
+                             "a brand-new account's only ledger activity is its "
+                             "opening grant")
+            self.assertEqual(activity[0]["counterparty_account_id"], SYSTEM_ACCOUNT_ID,
+                             "the grant's counterparty must be the named __system__ "
+                             "account, so the balanced pair is identifiable")
+            # ... and nothing was minted: the funder is untouched (the grant comes
+            # from __system__, not from the funder), and I2 below stays 0.
             self.assertEqual(self._balance(base, FUNDER), funder_before,
-                             "creating an account must move no money")
+                             "creating an account must move no money from the funder")
             with self._ledger(db_path) as conn:
-                self.assertEqual(entry_count(conn), entries_before,
-                                 "creating an account must write no ledger entries")
+                self.assertEqual(entry_count(conn), entries_before + 2,
+                                 "creating an account writes exactly the grant's "
+                                 "balanced pair — two entries — and nothing else")
                 self.assertEqual(idempotency_row_count(conn), idempotency_before,
-                                 "the create must mint no idempotency key at the API; "
-                                 "this is a DELTA around the create, because the "
+                                 "the grant is posted directly, not through the keyed "
+                                 "transfer path, so the create mints no idempotency "
+                                 "key; this is a DELTA around the create, because the "
                                  "fixture's own transfers legitimately hold keys")
                 assert_i1(conn)
                 assert_i2(conn)
@@ -468,6 +580,41 @@ class AccountsAndSwitching(unittest.TestCase):
                              "creating an account must not touch the pending store")
             self.assertEqual([rec.key for rec in self._records()], before_keys,
                              "creating an account must mint no idempotency key")
+
+    def test_the_rendered_balance_comes_from_the_server_not_from_a_constant(self):
+        """The claim above — the page shows ``$100.00`` — is only evidence if the
+        page would show something *else* when the server says something else.
+
+        So the server is made to answer 4242 minor units for the new account. The
+        page landed on after the create must render ``$42.42``. A template that
+        printed the grant — or any constant — shows ``$100.00`` here and fails
+        this row, while every row above it stays green; that difference is exactly
+        what "from the server value" buys, and nothing else in this file tests it.
+
+        Read through ``_balance_text``, not ``assertIn``: the grant's own activity
+        row legitimately renders ``$100.00`` in the feed, so a substring search
+        would be satisfied by the wrong element — and by a page showing the wrong
+        balance.
+        """
+        with _running_api() as (_, base):
+            self._fund(base)
+            with _ui(self.store_path, base,
+                     transport=_SubstitutedBalance(NEW, 4242)) as port:
+                status, headers, _ = _request(
+                    port, "POST", "/create",
+                    {"owner_id": "t14-owner", "currency": "USD", "account_id": NEW})
+                self.assertEqual(status, 303,
+                                 f"POST /create must answer 303; got {status}")
+                follow, _, page = _request(port, "GET", headers.get("Location") or "")
+                self.assertEqual(follow, 200,
+                                 f"the 303 target must be a GET answering 200; got "
+                                 f"{follow}")
+                self.assertEqual(_active_account(page), NEW,
+                                 "the page must still be showing the new account")
+                self.assertEqual(_balance_text(page), "$42.42",
+                                 "the balance element must carry the number the "
+                                 "server answered with, not the grant the create "
+                                 "implies and not a constant")
 
     # -- 2. switching is presentational ---------------------------------------
 
@@ -699,8 +846,24 @@ class AccountsAndSwitching(unittest.TestCase):
                                      f"POST {path} must land on a GET that answers 200; "
                                      f"{location!r} gave {follow}")
 
-    def test_every_rendered_document_carries_the_demo_disclosure(self):
-        """Every ``text/html`` document the UI serves carries ``DEMO_NOTICE``.
+    def test_every_document_the_ui_builds_carries_the_demo_disclosure(self):
+        """Every document built through ``app/web.py``'s ``_document`` carries
+        ``DEMO_NOTICE`` — here, the four wallet routes listed below, each of
+        which renders through it.
+
+        Scope, stated because the previous name over-claimed it. The name used to
+        read "every ``text/html`` document the UI serves", which is false:
+        ``WalletUIHandler`` does not override ``BaseHTTPRequestHandler.send_error``,
+        so the stdlib emits its own ``text/html`` error pages that never pass
+        through ``_document`` and carry no notice. Measured on this tree
+        (2026-10-04): ``PUT``/``DELETE``/``PATCH /`` answer ``501`` with
+        ``Content-Type: text/html;charset=utf-8`` and zero markers; a malformed
+        request line answers ``400`` and an unsupported HTTP version answers
+        ``505``, both stdlib pages with zero markers. Closing that hole means
+        overriding ``send_error``/``error_message_format`` in ``app/`` — not this
+        row's work, and deliberately not asserted here. The claim is therefore the
+        covered set: documents the UI itself assembles, sampled at the routes
+        below. The uncovered emitter is ``BaseHTTPRequestHandler.send_error``.
 
         This is a disclosure property, not a money invariant, and it is pinned
         because the plan resolved open registration as a *decision*: any visitor
@@ -757,7 +920,7 @@ class AccountsAndSwitching(unittest.TestCase):
     def test_a_pending_transfer_names_the_account_that_sent_it(self):
         """On B's page, A's unconfirmed transfer must not read as B's.
 
-        ``_pending_block`` lists every record in the store unfiltered, so a page
+        ``pending_block`` lists every record in the store unfiltered, so a page
         can show a transfer the viewer is not party to. What makes that honest is
         the sender being named in the record's own item. Asserting on the item
         rather than the page is deliberate: an id somewhere on the document —
@@ -798,7 +961,7 @@ class AccountsAndSwitching(unittest.TestCase):
         with _running_api() as (_, base):
             self._fund(base)
             self._fund_store(base)
-            with mock.patch.object(app_web, "_pending_block",
+            with mock.patch.object(app_web, "pending_block",
                                    _pending_block_without_the_sender):
                 with _ui(self.store_path, base) as port:
                     _, _, page = _request(port, "GET", f"/?account={OTHER}")
