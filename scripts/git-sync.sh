@@ -25,6 +25,11 @@
 
 set -uo pipefail   # deliberately NOT -e: every failure below has its own report.
 
+# cron runs with a minimal PATH (/usr/bin:/bin) and this box keeps git and band
+# under ~/.local/bin, so without this line the script dies at the first command
+# with "git: command not found" — and reports it as a git failure.
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOM="a0449e0d-0400-4748-80ab-cc2783c3634e"      # New Session — the team room
 KEEPER="a0ad0555-bd78-42cf-9001-dfa5eec66a31"    # Git Keeper identity id
