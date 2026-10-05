@@ -1,5 +1,5 @@
 import copy, json, os, secrets, threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -782,6 +782,15 @@ def parse_instant(value):
     except Exception:
         raise ValueError
 
+def after_revisions(*revision_sets):
+    recorded = parse_instant(ts())
+    priors = [parse_instant(r["recorded_at"]) for revisions in revision_sets for r in revisions]
+    if priors:
+        latest = max(priors)
+        if recorded <= latest:
+            recorded = latest + timedelta(seconds=1)
+    return recorded.isoformat()
+
 def ensure_revisions(payment):
     revisions = payment.setdefault("revisions", [])
     if not revisions:
@@ -860,7 +869,7 @@ def payment_correction(pid):
         elif delta < 0:
             S.users[payment["to_user_id"]]["balance"] += delta
             S.users[payment["from_user_id"]]["balance"] -= delta
-        revision = {"payment_id": pid, "revision": expected + 1, "amount": amount, "effective_at": data["effective_at"], "recorded_at": ts(), "reason": reason}
+        revision = {"payment_id": pid, "revision": expected + 1, "amount": amount, "effective_at": data["effective_at"], "recorded_at": after_revisions(revisions), "reason": reason}
         revisions.append({k: revision[k] for k in ("revision", "amount", "effective_at", "recorded_at", "reason")})
         save_idempotency(user, key, data, revision)
         return jsonify(revision), 201
@@ -1017,7 +1026,7 @@ def correction_batch():
             if delta and S.users[debtor]["balance"] - S.held(debtor) < abs(delta):
                 return error(409, "insufficient_funds")
         bid = "cb_" + secrets.token_urlsafe(8)
-        recorded = ts()
+        recorded = after_revisions(*(revisions for _item, _payment, _amount, _expected, revisions in parsed))
         out = []
         for item, payment, amount, expected, revisions in parsed:
             delta = amount - revisions[-1]["amount"]
