@@ -6,7 +6,7 @@
 # read from a mode-600 file OUTSIDE the repository.
 #
 # Why it is built this way: the token must never reach .git/config, the remote
-# URL, or any process argv. A credential helper or a `https://user:token@host`
+# URL, or any process argv. A credential helper or a URL with embedded credentials
 # remote would put it in both, where it survives in the repo and in `ps`. Here it
 # is read from a file at the moment git asks and never written anywhere.
 #

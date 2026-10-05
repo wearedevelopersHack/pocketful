@@ -1,125 +1,33 @@
-# FACTORY.md — the Pocketful agent factory
+﻿# Pocketful factory
 
-Pocketful is built by a room of agents, each with one seat, one territory and one
-kind of evidence. This document is the factory's map: who the seats are, what
-each one owns, what each one deliberately does **not** own, and the rules that
-make the separation real.
+This is the submission factory for the official Pocketful stages. The earlier multi-agent product demo and its release process are documented in [LEGACY-FACTORY.md](LEGACY-FACTORY.md). The final BAND run uses a separate three-seat roster, generic mandates, and a fresh result checkout. The accepted stage folders are merged into this shared repository with their original commits preserved.
 
-The contract for the *product* is [`INVARIANTS.md`](INVARIANTS.md). It outranks
-this document and every plan written in the room. This document is the contract
-for the *work*.
+## Roster and setup
 
----
+| Seat | BAND handle | Responsibility |
+| --- | --- | --- |
+| API Engineer | `@tuannvd2511/api-engineer` | Coordinates each stage and implements its service. |
+| UI Designer | `@tuannvd2511/ui-designer` | Owns the browser interface and interaction checks. |
+| Reviewer | `@tuannvd2511/reviewer` | Independently checks the written requirements and delivered revision. |
 
-## How work flows
+All three use the Codex ACP harness with model `gpt-5.5`, authenticated with a ChatGPT account. Their reusable instructions are in [mandates/](mandates/). The local Windows launcher was `C:\Users\boy03\AppData\Roaming\npm\codex-acp.cmd`; this path is an example from the run, not a runtime dependency of the service. The factory's final room ID is `bd8d60bb-486a-410c-9e6f-28b03f88f360`, and its unchanged full export is `room.json`.
 
-1. **The planner** decomposes the objective into board tasks. Exactly one owner
-   per task. Each task carries a definition of done and its real blocking edges.
-2. **An owner** makes the change inside their own territory.
-3. **The owner** attaches evidence: a check that fails without the change and
-   passes with it, plus the exact command they ran and its passing output.
-4. **The reviewer** attacks money-path changes adversarially. A money-path change
-   with an invariant defect is blocked.
-5. **The git keeper** publishes the revision to the remote.
-6. **The deploy engineer** ships it and verifies the public URL answers.
+To repeat the factory, create three distinct coding-agent identities in BAND, load the corresponding mandates, authenticate each runtime, point them at one clean result repository, and add them to one room. Dispatch the complete stage sequence once, with paths to the written specifications, the result repository, file ownership, acceptance rules, and instructions for the lead to pass the full task and specification to each recipient. The human does not steer a stage after dispatch. The coordinator makes the ordinary decisions within the room and reports an honest blocker if progress becomes impossible.
 
-A claim of completion with no quoted evidence is not completion. It is sent back.
+## Work and review
 
----
+The API Engineer reads the entire current specification and delegates scoped work by exact `@handle`. Each delegated message includes the complete task and relevant specification text. Recipients acknowledge the handoff and reply to findings. File ownership is agreed before concurrent edits. The UI Designer owns the user interface once a stage requires one. The Reviewer stays independent from primary implementation, runs checks and inspects requirements outside the public tests, then accepts or rejects the committed revision with a reproducer. A rejected result goes back to its owner for a new change and another review.
 
-## The seats
+Each accepted stage remains in a complete `stage-N/` folder with `Dockerfile`, `RUN.md`, and a service that runs in one container. The next stage starts by copying the previous accepted folder and extending it. The room and Git history provide the evidence for these handoffs and changes. The human writes submission documentation, runs an independent gate, exports the room, and publishes the existing commits.
 
-| Seat | Handle | Territory |
-|---|---|---|
-| Planner | `priyanshuojhadmr1/planner` | the board, the contracts, the sequencing |
-| Ledger Engineer | `priyanshuojhadmr1/ledger-engineer` | `ledger/` |
-| Integrator | `priyanshuojhadmr1/integrator` | `api/`, and the full gate |
-| Frontend Engineer | `priyanshuojhadmr1/frontend-engineer` | `app/web.py`, `app/client.py`, the key store |
-| Designer | `priyanshuojhadmr1/designer` | `app/design.py`, `DESIGN-SPEC.md` |
-| Test Author | `priyanshuojhadmr1/test-author` | `tests/`, the harness, the gate's assertions |
-| Reviewer | `priyanshuojhadmr1/reviewer` | adversarial review of the money path |
-| Deploy Engineer | `priyanshuojhadmr1/deploy-engineer` | the host, TLS, the domain, rollback |
-| Git Keeper | `priyanshuojhadmr1/git-keeper` | what is in the repository, and the remote |
-| Session Reporter | `priyanshuojhadmr1/session-reporter` | read-only digests of the room |
+## Design choices and failure handling
 
-Each seat's full mandate lives in [`roles/`](roles/). The table below is the
-summary that matters for decomposition.
+All seats work in one checkout, which makes changes visible to the reviewer and offline harness without syncing sandboxes. The tradeoff is possible edit collisions, so the lead assigns exact file ownership. Agents use the official written specifications for behavior; partial public checks provide feedback and cannot substitute for requirements. The delivered service is isolated in `stage-N/` because the prior hosted Pocketful demo uses a different API contract.
 
-### What each seat does NOT own
+The initial delivery review rejected Stage 1 when its Dockerfile referenced an absent service file. The Reviewer posted the failing build command in the room; the API Engineer then added the service. The first complete host harness run found two additional failures involving idempotency across different paths and export restoration. The final acceptance evidence and measured elapsed time will be recorded after the agents finish their re-review. The Windows isolated harness encountered a path interpretation error when passing a Windows-style test path into the Linux test container; the host harness and direct Docker build provide separate checks until an isolated run works under WSL2.
 
-A seat's boundary is the useful half of its mandate — it is what stops two agents
-from writing the same file.
+If the runtime fails, the room keeps the error and the seat can resume its assigned work. A reviewer rejection requires a concrete fix and a checked revision. An unresolved requirement is reported as a limitation, never counted as an accepted stage. The public repository preserves the original agent commits and the prior product team's history without squashing.
 
-- **Planner** does not write or edit anything under `ledger/`, `app/`, `api/` or
-  `tests/`. A planner who implements has lost the ability to review the plan.
-- **Ledger Engineer** does not touch the HTTP surface, the UI, or the tests. The
-  ledger is correct in isolation; the integrator makes it correct behind an API.
-- **Integrator** does not edit `tests/`. The gate is never made green by changing
-  a test.
-- **Frontend Engineer** does not own the visual system's tokens and components —
-  those are authored in `app/design.py` and composed by `app/web.py`.
-- **Designer** does not implement. Their product is the spec and the module that
-  encodes it; the page is the frontend engineer's.
-- **Test Author** does not fix production code. A failing row is reported to the
-  owner, never reconciled by weakening the assertion.
-- **Reviewer** does not edit. Their product is a verdict with a reproduction.
-- **Deploy Engineer** does not change DNS records without asking first, and never
-  writes a secret into the repository, a log, a message, or the room.
-- **Git Keeper** does not decide what the product does. They decide what is saved.
-- **Session Reporter** does not edit files or write to the repository. Their only
-  write is their own digest, in their own room.
+## Measured run
 
----
-
-## The rules that make the separation real
-
-**One owner per piece of state.** If two agents would modify the same value, that
-is one unit of work with one owner — not two tasks that coordinate.
-
-**One owner per file.** Two agents are never assigned to edit the same file in
-parallel. Overlap is the most common way a multi-agent build corrupts itself.
-
-**Few large, well-bounded tasks over many small ones with handoff edges.** Every
-handoff is a place the design can drift.
-
-**The gate is the evidence.** `./run_gate.sh` runs four phases:
-
-1. `python3 -m unittest discover -s tests -t . -v`
-2. `compileall -q -f ledger api tests app`
-3. `python3 -m api.lint`
-4. `python3 -m api.selfcheck` — real HTTP over a real ledger
-
-Judge a gate run by its **phase split and exit code**, never by counting `FAIL`
-lines: the suite deliberately prints the red half of its own mutant rows, so a
-green run contains `FAIL` text.
-
-**The pin is the revision.** The gate prints a tree pin (a hash over `tests/`,
-`ledger/`, `api/` and `app/`) before and after the run. If the two differ it
-prints `PIN MOVED DURING RUN` and its exit status binds nothing, because the run
-did not describe one revision. A green result is a statement about a pin, not
-about "the code".
-
-**Gate membership resolves to the function, not the file.** A module is not in the
-gate because its name looks like a phase; it is in the gate because something the
-gate runs calls it. Verify by searching the callers, not the filename.
-
-**Never make the gate green by editing a test.**
-
----
-
-## Money rules
-
-Money is an **integer count of minor units**. Never a float. Every balance change
-is a **balanced ledger entry pair summing to zero**. Every state-changing request
-carries a **client-supplied idempotency key**. Nothing may create, destroy, or
-apply money twice.
-
-The full contract is [`INVARIANTS.md`](INVARIANTS.md).
-
----
-
-## Version control
-
-There is a repository and a public remote. A change that exists only in a working
-tree does not exist. The git keeper owns the push; a scheduled script also
-snapshots periodically. No credential ever reaches a commit.
+The single final dispatch was posted on 2026-10-05 at 04:27:53 UTC (11:27:53 in Vietnam). The three final seats were observed using `gpt-5.5` in local Codex session records. The ACP runtime does not expose an actual provider bill; token counts may be reported from those local records after the run. Before publishing, update this section with accepted stage revisions, checks, elapsed time, and limitations from the final coordinator and reviewer reports.
