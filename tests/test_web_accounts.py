@@ -80,7 +80,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from unittest import mock
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import app.client as app_client
 from app.client import ApiClient
@@ -163,6 +163,56 @@ def _create_card_error(page):
         return None
     found = _CARD_ERROR_TEXT.search(card.group(1))
     return found.group(1) if found else None
+
+
+def _handle_create_without_the_parameter():
+    """MUTANT: the landed ``_handle_create``, minus the ``&taken_id=`` echo.
+
+    Filtered out of ``inspect.getsource`` of the real method rather than retyped,
+    for the same reason ``_unquoted`` is: a hand-reconstruction of the pre-fix
+    bytes would have no witness but its author's memory, and would stop being a
+    mutant the moment the landed body changed shape around it.
+
+    The premise that it really removed the line is the falsifier's job, not this
+    function's — a filter that matched nothing would otherwise return the
+    *unmutated* method and the falsifier would go green on a no-op.
+    """
+    source = textwrap.dedent(
+        inspect.getsource(app_web.WalletUIHandler._handle_create))
+    kept = [line for line in source.splitlines() if "taken_id" not in line]
+    namespace = dict(vars(app_web))
+    exec("\n".join(kept), namespace)
+    return namespace["_handle_create"]
+
+
+def _refusal_transport_problems(location, derived):
+    """Why the refusal failed to **carry** ``derived``; ``[]`` when it does.
+
+    The other half of the composition, and a separate predicate on purpose. The
+    banner can only name the address because the redirect carried it, so the two
+    halves are causally chained — but they fail independently: the pre-fix
+    template reds the banner alone, while dropping ``&taken_id=`` reds this one
+    (and, through the chain, the banner too). Two predicates make the report say
+    *which* link broke instead of "the refusal is wrong".
+
+    ``new_id`` is asserted empty here as well: filling it from the derived
+    address would turn a blank-address resubmit into an explicit-id create and
+    hand the next request to the ``account_exists`` sibling, so the branch this
+    row is about would stop being reachable from the control that reached it.
+    """
+    query = urllib.parse.parse_qs(urlsplit(location).query, keep_blank_values=True)
+    problems = []
+    if query.get("error") != ["name_taken"]:
+        problems.append(f"a blank-address collision is the address refusal; the "
+                        f"redirect says {location!r}")
+    if query.get("taken_id") != [derived]:
+        problems.append(f"the refusal's subject must travel in its own parameter "
+                        f"and be the address that collided ({derived!r}); the "
+                        f"redirect says {location!r}")
+    if query.get("new_id") != [""]:
+        problems.append(f"nothing was typed into the address field, so the echo "
+                        f"must leave it blank; the redirect says {location!r}")
+    return problems
 
 
 def _refusal_problems(page, derived):
@@ -471,8 +521,21 @@ class _SubstitutedBalance:
         self.currency = currency
 
     def __call__(self, method, url, body, headers):
+        # Expect the **quoted** path, because that is what the client actually
+        # sends: an account id is opaque and ``app/client.py`` quotes it on the
+        # way into the URL (``pocketful-id-in-url-path-unencoded``). This is not a
+        # weakened check — it is the same equality, with the fake on the same
+        # terms as the wire. Left unquoted it would compare against a path the
+        # client no longer sends for any non-safe id, silently *not* intercept,
+        # and forward that read over the real wire; the row using this fake would
+        # then be judging the server's answer while believing it was judging the
+        # substitute. The fixture id here is a legal path segment, so the two
+        # spellings coincide today and a diff of this line alone would look like
+        # a no-op — which is exactly why the reason is written down rather than
+        # the equality being loosened to a ``in url``.
         if (method == "GET"
-                and urlsplit(url).path == f"/accounts/{self.account_id}/balance"):
+                and urlsplit(url).path
+                == f"/accounts/{quote(self.account_id, safe='')}/balance"):
             return 200, json.dumps({
                 "account_id": self.account_id,
                 "balance_minor": self.balance_minor,
@@ -1036,25 +1099,14 @@ class AccountsAndSwitching(unittest.TestCase):
                     f"the colliding create must be refused into a GET, not "
                     f"rendered on the POST; got {status} with body {body[:160]!r}")
                 location = headers.get("Location") or ""
-                query = urllib.parse.parse_qs(urlsplit(location).query,
-                                              keep_blank_values=True)
-                self.assertEqual(query.get("error"), ["name_taken"],
-                                 f"a blank-address collision is the address refusal; "
-                                 f"got {location!r}")
-                self.assertEqual(
-                    query.get("taken_id"), [derived],
-                    f"the refusal's subject must travel in its own parameter and "
-                    f"be the address that collided ({derived!r}); got {location!r}")
-                self.assertEqual(
-                    query.get("new_id"), [""],
-                    "the address input was left blank, so the echo must leave it "
-                    "blank: filling it from the derived address would turn a "
-                    "resubmit into an explicit-id create and answer with the "
-                    "account_exists sibling instead, so this branch would stop "
-                    "being exercised by the control that reached it")
                 landed, _, page = _request(port, "GET", location)
 
-        self.assertEqual(landed, 200, f"the refusal must land on a GET answering 200")
+        self.assertEqual(landed, 200, "the refusal must land on a GET answering 200")
+        self.assertEqual(
+            _refusal_transport_problems(location, derived), [],
+            "the refusal must carry the address it collided with, in its own "
+            "parameter; "
+            + "; ".join(_refusal_transport_problems(location, derived)))
         self.assertEqual(_refusal_problems(page, derived), [],
                          "the create card's refusal must name the address that "
                          "collided; " + "; ".join(_refusal_problems(page, derived)))
@@ -1144,6 +1196,66 @@ class AccountsAndSwitching(unittest.TestCase):
                 f"report exactly one problem; got {problems!r}")
             self.assertIn("does not name the address", problems[0],
                           f"and the problem must be the missing address; got {problems!r}")
+
+    def test_the_taken_address_row_goes_red_when_the_parameter_is_dropped(self):
+        """FALSIFIER (the other half): the redirect, with ``&taken_id=`` removed.
+
+        The banner cannot name an address the redirect never carried, so this
+        half is causally upstream of the one above — and until this row existed
+        nothing showed that *either* half of the composition could fail. A link
+        with no falsifier is a link whose assertion has never been observed
+        failing, which is the same thing as not having one.
+
+        The mutant is built from ``inspect.getsource`` of the landed
+        ``_handle_create`` with the one ``taken_id`` line filtered out, so it
+        cannot drift from the body it mutates. Two premises are asserted before
+        the effect: the mutant must still reach the address refusal (or the row
+        below measures a different branch), and it must still render a create-card
+        banner (or the red is a broken page, not a dropped parameter).
+
+        Because the halves are chained, this mutant reds the banner predicate
+        too. That is stated rather than engineered away: the *transport*
+        predicate is the one the red is attributed to, and the chained red is
+        what "the banner can only name what the redirect carried" means.
+        """
+        mutant = _handle_create_without_the_parameter()
+        landed_method = app_web.WalletUIHandler._handle_create
+        with mock.patch.object(app_web.WalletUIHandler, "_handle_create", mutant):
+            self.assertIs(app_web.WalletUIHandler._handle_create, mutant,
+                          "the mutant must be the method the handler dispatches to")
+            self.assertNotEqual(
+                mutant.__code__.co_code, landed_method.__code__.co_code,
+                "the mutant must differ from the landed method: the filter that "
+                "builds it returns the original if it matches nothing, and a "
+                "no-op mutant would make the red below unreachable")
+            with _running_api() as (_, base):
+                self._fund(base)
+                with _ui(self.store_path, base) as port:
+                    derived = self._land_a_derived_address(port)
+                    _, headers, _ = self._collide_on_that_address(port)
+                    location = headers.get("Location") or ""
+                    _, _, page = _request(port, "GET", location)
+
+            self.assertIn("error=name_taken", location,
+                          "the mutant must still reach the address refusal, or the "
+                          "output below measures a different branch")
+            self.assertIsNotNone(
+                _create_card_error(page),
+                "the mutant must still render a create-card banner, or the red is a "
+                "broken page rather than a dropped parameter")
+            problems = _refusal_transport_problems(location, derived)
+            self.assertEqual(
+                len(problems), 1,
+                f"the row above, run as written against a redirect that dropped its "
+                f"parameter, must report exactly one transport problem; got "
+                f"{problems!r}")
+            self.assertIn("own parameter", problems[0],
+                          f"and the problem must be the missing parameter; got "
+                          f"{problems!r}")
+            self.assertNotEqual(
+                _refusal_problems(page, derived), [],
+                "and the chained half must red with it: a banner cannot name an "
+                "address the redirect did not carry")
 
     # -- 2. switching is presentational ---------------------------------------
 

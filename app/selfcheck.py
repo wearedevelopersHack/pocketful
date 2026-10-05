@@ -888,12 +888,15 @@ def scenario_web_ui(base_url: str, workdir: str, payer: str, payee: str) -> None
         #
         # And it cannot pin that clause, which the reviewer measured rather than
         # argued: with `quote` in place at both client sites the path is always
-        # phraseable, so `app/web.py:461` is unreachable by construction — remove
-        # the `except http.client.HTTPException` clause alone, leave everything
-        # else byte-identical, and this scenario is **64/64**. The row reds on
-        # `dropped` only when the transport cannot phrase the id, and then on
-        # `status=500` instead if web.py has stopped keeping the entry. A second
-        # line, unpinnable by this row and by nothing else in the gate.
+        # phraseable, so the `except http.client.HTTPException` clause in
+        # `_probe_account` is unreachable by construction — remove that clause
+        # alone, leave everything else byte-identical, and this scenario is
+        # **64/64**. (Named, not cited by line: a line number in a comment is a
+        # witness that goes stale the moment anyone edits above it, and this one
+        # had already drifted before the row shipped.) The row reds on `dropped`
+        # only when the transport cannot phrase the id, and then on `status=500`
+        # instead if web.py has stopped keeping the entry. A second line,
+        # unpinnable by this row and by nothing else in the gate.
         name_cookie = urllib.parse.quote(
             json.dumps(["Cookie Probe"], separators=(",", ":")), safe="")
         status, headers, page = _ui_call(
