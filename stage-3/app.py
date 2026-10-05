@@ -314,10 +314,7 @@ def me():
                 return error(422, "validation_failed")
     held = S.held(user["id"])
     body = dict(user_id=user["id"], display_name=user["display_name"], handle=user["handle"], balance=user["balance"], total=user["balance"], available=user["balance"] - held, held=held, currency=S.currency, minor_units=S.minor_units)
-    if as_of is not None:
-        body["as_of"] = as_of
-    if known_at is not None:
-        body["known_at"] = known_at
+    body.update({k: v for k, v in {"as_of": as_of, "known_at": known_at}.items() if v is not None})
     return jsonify(body)
 
 def pay_fields(data, handle_name):
