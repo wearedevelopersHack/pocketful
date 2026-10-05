@@ -12,6 +12,41 @@ using its `Dockerfile` and `RUN.md`. The original Python demo in the repository
 root is separate background work; its API contract predates the official stage
 specification.
 
+## Run the submitted app
+
+From the repository root, use the final stage:
+
+```powershell
+cd .\stage-4
+docker build -t pocketful-stage-4 .
+docker run --rm -p 8080:8080 pocketful-stage-4
+```
+
+Open <http://localhost:8080/>. The service keeps its state in memory, so a new
+container starts empty. For a repeatable browser walkthrough, seed two fictional
+users in another PowerShell terminal:
+
+```powershell
+$fixture = @{
+  currency = 'EUR'
+  minor_units = 2
+  users = @(
+    @{ id = 'u_ada'; email = 'ada@example.com'; display_name = 'Ada'; handle = 'ada'; password = 'password123'; balance = 100000 },
+    @{ id = 'u_bob'; email = 'bob@example.com'; display_name = 'Bob'; handle = 'bob'; password = 'password123'; balance = 5000 }
+  )
+} | ConvertTo-Json -Depth 6
+Invoke-RestMethod -Method Post -Uri 'http://localhost:8080/_test/reset' -ContentType 'application/json' -Body $fixture
+```
+
+Sign in as Ada with `ada@example.com` / `password123` and send `12.34` EUR to
+`bob`. Sign in as Bob with `bob@example.com` / `password123` to see the received
+payment. The reset endpoint is for the local test fixture; the sample passwords
+are not production credentials.
+
+From the official harness checkout, run `python -m harness check <repo> --track
+pocketful` to inspect submission structure, then `python -m harness run --track
+pocketful --repo <repo> --stage 4 --out <report-dir>` to run the stage suites.
+
 ## Original demo
 
 The original demo has a Python web UI, an HTTP API, and a SQLite double-entry
