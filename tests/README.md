@@ -622,11 +622,22 @@ python3 -m unittest tests.test_harness_selfcheck -v
 
     Boundary: this stays **client-side**. `%20` in a path segment *is* a space
     (RFC 3986), so decoding it at the server is correct and hardening the parser
-    against it would be a regression. And `tests/test_web_accounts.py`'s own
-    `RecordingTransport` asserts an **unquoted** path
-    (`urlsplit(url).path == f"/accounts/{self.account_id}/balance"`), green only
-    because its fixture id is legal — a trap for the next row that reuses that
-    fixture with a non-safe id, recorded here rather than left to be discovered.
+    against it would be a regression.
+
+    **The fixture trap this row found is fixed, not just recorded.** This file's
+    `_SubstitutedBalance` is a fake transport that intercepts one account's
+    balance GET by comparing the request path; it compared against
+    `f"/accounts/{self.account_id}/balance"` — the *unquoted* spelling. Green
+    today only because its fixture id is a legal path segment, and a landmine for
+    the next row that reuses it with a non-safe id: the fake would silently
+    decline to intercept and forward the read over the real wire, so the row
+    would be judging the server while believing it was judging the substitute. It
+    now compares against `quote(self.account_id, safe='')` — the same equality,
+    with the fake on the same terms as the wire — **and carries the reason in a
+    comment at the line**, because a diff cannot tell "fixed the expectation"
+    from "loosened the check to make something pass", and the comment is the only
+    artifact that can. Not loosened to an `in url` substring for exactly that
+    reason.
 
     **The refusal.** Two names can derive one address (`Grace Hopper`,
     `grace  hopper` and `Grace-Hopper` all render `acct-grace-hopper`), so a
@@ -647,12 +658,24 @@ python3 -m unittest tests.test_harness_selfcheck -v
     attribute. The row reads the `section#create`, then the banner inside it,
     then the text node.
 
+    The composition has **two** predicates and **two** falsifiers, one per link,
+    because a link with no falsifier is an assertion never observed failing —
+    which is the same as not having one. `_refusal_transport_problems` judges the
+    redirect (the code, the parameter, and `new_id` left blank);
+    `_refusal_problems` judges the create card's banner. The pre-fix template
+    reds the banner alone. The second mutant — the landed `_handle_create` with
+    its `&taken_id=` line filtered out of `inspect.getsource`, so it cannot drift
+    — reds the transport predicate, and reds the banner with it, because the
+    halves are causally chained: a banner cannot name an address the redirect
+    never carried. That coupling is stated in the row rather than engineered
+    away, and the falsifier asserts the mutant really differs from the landed
+    method (a filter matching nothing returns the original and would make the red
+    unreachable), still reaches the address refusal, and still renders a banner.
+
     Red-first was **not** available here: `app/web.py` landed the fix before the
     row could be written. The substitution is stated plainly rather than papered
-    over — the red is delivered by an in-gate mutant that restores the pre-fix
-    rendering (the static copy, no address, no placeholder) and leaves every
-    other line of the landed code in place, with its premise asserted first so an
-    inert patch cannot make the row's red read as proof.
+    over — the red is delivered by the in-gate mutants above, with their premises
+    asserted first so an inert patch cannot make a row's red read as proof.
 
 ### Scoping rule
 

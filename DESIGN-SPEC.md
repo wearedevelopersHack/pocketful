@@ -146,6 +146,8 @@ tables are quoted in §3.4.
   --surface-2:     #eef2f7;
   --border:        #dfe4ec;   /* decorative separators only */
   --border-strong: #6b7280;   /* input/control boundaries — must clear 3:1 */
+  --border-edge:   #dfe4ec;   /* panel edges — §5.9. Resolves to the hairline
+                                 here, and to --border-strong under dark */
 
   /* text */
   --text:      #111827;
@@ -186,6 +188,7 @@ tables are quoted in §3.4.
     --surface-2:     #18202c;
     --border:        #2a3646;
     --border-strong: #64748b;
+    --border-edge:   #64748b;   /* §5.9 — in dark the card's shadow is nil */
 
     --text:   #e8edf5;
     --text-2: #b6c2d4;
@@ -215,6 +218,14 @@ tables are quoted in §3.4.
 **`--border-strong: #64748b` is not arbitrary.** My first dark candidate (`#55657c`) measured
 **2.95:1** against `--surface` `#131a24` — under the 3:1 that WCAG 1.4.11 requires of a
 control boundary. It was changed to `#64748b` (**3.67:1**). Do not "tidy" this value back down.
+
+**`--border-edge` is a third job, added 2026-10-05 (§5.9).** `--border` is a decorative
+hairline and `--border-strong` is a control boundary. A *panel* is neither: its border is
+load-bearing only in the palette where nothing else carries it. In light the card is held by
+its fill step **and** its shadow, so `--border-edge` is the same `#dfe4ec` as before and the
+light rendering is unchanged; in dark both of those collapse and it becomes `#64748b`
+(**3.67:1** against `--surface`, **4.03:1** against `--bg`). The light value is asserted equal
+to `--border` by a gate row, so the claim "light did not move" is measured, not promised.
 
 ### 3.2 Type
 
@@ -273,7 +284,12 @@ boundaries, focus rings and large text 3:1.
 | success `#15803d` on `--ok-bg` | 4.79:1 | 4.5 | PASS |
 | credit `#15803d` on `--surface` | 5.02:1 | 4.5 | PASS |
 | control border `#6b7280` on `--surface` | 4.83:1 | 3.0 | PASS |
+| control border `#6b7280` on `--bg` | 4.55:1 | 3.0 | PASS |
 | focus `#1d4ed8` on `--bg` | 6.31:1 | 3.0 | PASS |
+
+The **panel edge** in light is `#dfe4ec` on `--surface` — **1.28:1**, deliberately, and the only
+sub-3:1 boundary in this spec. It is not a control boundary and it is not the card's only
+signal; §5.9 states the reasoning and the gate row that holds it to it.
 
 **Dark**
 
@@ -289,7 +305,19 @@ boundaries, focus rings and large text 3:1.
 | pending `#fcd34d` on `--pending-bg` | 10.24:1 | 4.5 | PASS |
 | success `#86efac` on `--ok-bg` | 10.95:1 | 4.5 | PASS |
 | control border `#64748b` on `--surface` | 3.67:1 | 3.0 | PASS |
+| panel edge `#64748b` on `--surface` | 3.67:1 | 3.0 | PASS |
+| panel edge `#64748b` on `--bg` | 4.03:1 | 3.0 | PASS |
+| `--shadow-1` composited over `--bg` | 1.04:1 | — | **not a boundary** |
 | focus `#93c5fd` on `--bg` | 10.64:1 | 3.0 | PASS |
+
+The shadow row is the reason the dark panel edge exists. `--shadow-1` in dark is
+`0 1px 2px rgb(0 0 0 / 0.4)`; composited over `--bg #0b0f16` it gives `#07090d` — a black
+shadow on a near-black page, **1.04:1**, i.e. nothing. It is not that the shadow is weak:
+shadows do not survive a dark background, which is why the card's boundary is the border
+there and both fill and shadow here. (An earlier claim of mine, that the *light* shadow had
+been carried into dark unchanged, was false — `app/design.py:115` has always overridden it.
+The planner measured it; the conclusion is unchanged and in fact sharper, since a properly
+dark shadow is still nil.)
 
 ---
 
@@ -526,6 +554,24 @@ reader gets the column relationships for free).
 | Who | `counterparty_account_id` | Truncated id, full value in `title`. If the counterparty is the **system/faucet account**, show the label the server supplies (§9 item B) — do not guess it client-side. |
 | Amount | `amount_minor` | `−$2.50` for debit, `+$2.50` for credit, `--font-mono`-free but tabular, right-aligned. The sign is a character, not a colour. |
 
+**The When column landed 2026-10-05** (`_when_display`, `app/design.py`; board #29). It renders
+`4 Oct 2026, 08:33 UTC` — day, abbreviated month, year, `HH:MM`, and the zone **named** — with
+the raw `created_at` string kept in the cell's `title`. Three properties, each a decision:
+
+- **Always UTC, and it says so.** Rendering a local time would make the page depend on the
+  reading machine's clock settings, and every row that measures this page would then depend on
+  the machine it runs on. Naming the zone costs five characters and removes both problems. An
+  offset in the record is genuinely converted, not relabelled: `23:59` at `-05:00` renders
+  `04:59` the next day.
+- **Anything unparseable is shown verbatim**, and a *zoneless* timestamp is one of those. It
+  parses as a datetime and its zone is still unknown, so restating it under a `UTC` label would
+  be the module inventing a fact about the record.
+- **The record is narrowed, not lost.** The exact string stays in `title`, so a copy of the
+  stored value is one hover away and the display never has to carry microseconds to be honest.
+
+The pending list's timestamp uses the same function. Two surfaces rendering a timestamp in two
+dialects is how a page ends up looking like two products.
+
 **Two rules about the amount cell, both learned the hard way on 2026-10-04.** First, **the sign
 is suppressed when the amount is unavailable** — the module emits the placeholder alone, never
 `+—`, because a direction glyph on a placeholder asserts a credit for a figure the module does
@@ -722,6 +768,79 @@ then the *feature* was withdrawn too, so the caution is now subsumed rather than
 **First-run (no account at all):** the current UI always has a boot account (`--account`,
 `app/web.py:582`), so a true empty first-run is the API-404 document (§5.1). Restyle it to
 the §5.7 danger pattern with a "Create an account" action as the primary path out.
+
+---
+
+### 5.9 Boundaries, and the family that repeats one mistake
+
+Written 2026-10-05, board #29 (T43). This section exists because of a defect I made and then
+made twice.
+
+**The defect.** The card's boundary is carried by three signals: its fill step (`--surface` on
+`--bg`, **1.06:1** light / **1.10:1** dark), its shadow, and its 1px border. In dark the shadow
+composites to **1.04:1** — nothing (see §3.4). So in dark all three fail at once and the border,
+measured at 1.43:1 against `--surface`, is the card's *only* signal and is below the 3:1 WCAG
+1.4.11 asks of a boundary. Every card on the page, in the palette the demo does not record in
+and therefore the one nobody was looking at.
+
+**The mistake, which is the part worth writing down.** Two messages earlier I had found and
+fixed exactly this on a different element. The demo notice's "quiet" treatment had shipped
+invisible: I measured its text (passing) and never its boundary. I repaired `.demo`, measured
+`.demo`, and stopped. **I fixed the instance and left the class** — the identical
+`1px solid var(--border)` was sitting on `.card`, `.topbar`, `.adv` and the switcher chips, and
+I had not grepped for the declaration. When a defect is found by measuring a *threshold*, the
+unit to fix and to sweep is the **declaration**, not the element where you happened to notice it.
+
+**The criterion, so this cannot degenerate into "darken everything".** A border is 1.4.11-relevant
+where it is the element's **only** signal that it is a distinct thing — its fill is within 3:1 of
+its backdrop **and** it casts no perceptible shadow. Applied to every member of the family:
+
+| Element | Fill vs backdrop | Shadow | Is the border the only signal? | Ruling |
+|---|---|---|---|---|
+| switcher entries | 1.00:1 (transparent over the card) | none | **yes** — and it is a **link**, so the border *is* the affordance | **`--border-strong`, both palettes** |
+| `.card` (dark) | 1.10:1 | 1.04:1 | **yes** | **`--border-edge` → strong in dark** |
+| `.card` (light) | 1.06:1 | present (1.22:1) | no — a raised card, held by fill + shadow | hairline, unchanged |
+| `.adv` rule (dark) | 1.00:1 — same `--surface` both sides | none | **yes**, the only separation there is | **`--border-edge`** |
+| `.topbar` rule | 1.06:1 / 1.10:1 | none | no — a *region* rule; the header's own content identifies it, and 1.4.11 does not bind region dividers | **hairline, ruled out** |
+| `.activity` row rules | 1.00:1 — same surface both sides | none | no — content structure, not a component; at the strong token they would be 3.67:1 bars across every row | **hairline, ruled out** |
+
+The last two are decisions, not omissions. They are recorded in `app/design.py` next to the rules
+themselves and on the exemption list in `tests/test_web_design.py`, so the next reader meets the
+reasoning rather than a gap.
+
+**What changed, and the light theme.** Two things. The switcher entries move to
+`--border-strong` — **in both palettes**, because a link whose only affordance is its border
+must be identifiable whatever the scheme, and because `.btn` and `input` already use that token
+for that exact job, so this makes the chips consistent with the controls beside them. And the
+card and the `.adv` rule take the new `--border-edge`.
+
+**This does change the light theme on the switcher chips** (1.28:1 → 4.83:1). Stated here rather
+than slipped in: it is the one visible light change, it is on a control rather than a surface,
+and it is a fix rather than a regression — a chip at 1.28:1 was not identifiable as a chip. The
+*cards* are byte-identical in light, and a gate row asserts `light[--border-edge] ==
+light[--border]` so that claim is measured rather than promised.
+
+**How it is held.** `tests/test_web_design.py` reads the stylesheet's **own text**: every border
+declaration on `var(--border)` must be on the ruled-out list, and the list fails if it goes
+stale. A new element added on the decorative hairline reddens it wherever it is added — there is
+no list of elements to remember to extend. Alongside that, the ratios themselves are asserted
+from the token values in both palettes, with the dark shadow's contribution **derived** by
+compositing rather than written down, so tuning a shadow or a page moves the number.
+
+**And a note on how the red-first check was run, because the obvious method is unsafe.** The
+planner's first suggestion was to reproduce the pre-fix bytes from the immutable release
+directory. **That route is real and it is the better one — the pre-fix bytes are recoverable, and
+a check that recovers them from an artifact beats one that reproduces them from a memory — but it
+is not readable from *this* tree**, so it is the reviewer's and the deploy-engineer's to use, not
+mine. What was used here is the second method, and it is the one that landed in the gate: put the
+pre-fix token back for one call and restore it in a `finally` — in-process, inside the test, which
+is safe. Doing the same thing by **rewriting the source file** is not: the pre-fix and post-fix
+values are the same length and the restore lands in the same mtime *second*, and CPython's
+bytecode cache keys on `(mtime_seconds, size)` — so a stale `.pyc` can be accepted and the whole
+suite then reports against bytes that are no longer on disk. I hit exactly that while verifying
+this change (the file read `#64748b`, the import returned `#2a3646`), and it is worth the
+paragraph because a "red-first" check that is really reading a stale cache is a check that
+certifies nothing. Clear `__pycache__` between a file-level mutation and the run.
 
 ---
 
