@@ -184,6 +184,24 @@ def run(client: Client, db_path: str) -> None:
           "new USD account opens WITH the §C2.3 opening grant: balance_minor 10000",
           f"{body}")
 
+    # §C2.3 restatement, EARNED rather than assumed. The 201 reports
+    # ``balance_minor = opening_grant_minor`` instead of reading the entries back,
+    # which the Planner ratified on one condition: a row tying the two together.
+    # They are not the same computation — the 201 restates the API's POLICY
+    # constant while the GET sums ``ledger_entries`` — so a drift between what we
+    # claim a new account is worth and what the ledger actually posted fails here
+    # and nowhere else. Hence the create and the read with nothing in between.
+    status, restated = client.call("POST", "/accounts",
+                                   {"owner_id": "restate", "currency": "USD",
+                                    "account_id": "acct-restate"})
+    status_read, derived = client.call("GET", "/accounts/acct-restate/balance")
+    restated_minor = restated.get("balance_minor") if isinstance(restated, dict) else None
+    derived_minor = derived.get("balance_minor") if isinstance(derived, dict) else None
+    check(status == 201 and status_read == 200 and restated_minor == derived_minor,
+          "the 201's balance_minor agrees with the balance read taken immediately "
+          "after it (the restatement cannot drift from the entries)",
+          f"201={restated_minor!r} GET={derived_minor!r} ({status}/{status_read})")
+
     # §C2.2 + §C2.4: the account_id IS the natural idempotency key, and a repeat
     # is REJECTED rather than replayed. The clause that carries the money meaning
     # is the second one — the refusal must not have posted a SECOND grant.

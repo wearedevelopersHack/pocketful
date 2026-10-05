@@ -28,7 +28,9 @@ python3 -m unittest tests.test_harness_selfcheck -v
 | `t4_client_child.py` | The child process obligation 10 spawns. Not a test — deliberately not named `test_*.py`. Holds the transport that records the outgoing header and `os.kill`s itself in the crash window. |
 | `test_web_reload.py` | Drives the real `app.web` UI as a real server against the real `api/` and ledger, models the browser's reload, and asserts a reload of the POST's *response* mints no second key; see obligations 11 and 12. |
 | `test_persist_ordering.py` | Drives `app.selfcheck.scenario_web_ui` under a store whose write is deferred past the attempt, so the persist-before-attempt row has a permanent falsifier; see obligation 13. |
-| `test_web_accounts.py` | Red-first: drives the real `app.web` UI against the real `api/` for account creation and switching, and pins the account-agnostic pending store; see obligation 14. |
+| `test_web_accounts.py` | Red-first: drives the real `app.web` UI against the real `api/` for account creation and switching, and pins the account-agnostic pending store; also carries C3.7's negative — the create-success document announces no welcome — the taken-*address* refusal that must name the address it collided with (obligation 18), and the opaque-id rows: every id the API accepted must read back as its own account through `app.client`'s two interpolating methods. See obligation 14, obligation 16 and obligation 18. |
+| `test_web_design.py` | Certifies `app/design.py`'s two markup constraints — the address whole in the header and truncated only in lists, a name beside the id and never instead of it — with a permanent falsifier per constraint, a hostile fixture through the name fields for the `_esc` mutant, and the cross-component row that the *readable* id survives on the real composition; see obligation 15. |
+| `test_kill_and_resume_coverage.py` | Brings `app/selfcheck.scenario_kill_and_resume`'s own verdict under the gate, bounded to that scenario's rows, with a store-loss falsifier that must flip exactly one named row; see obligation 17. |
 | `test_*.py` | The tests. |
 
 ## The five obligations
@@ -408,6 +410,249 @@ python3 -m unittest tests.test_harness_selfcheck -v
     create. The correction did not weaken it: any key the create minted still
     moves the number. The rule it broke was already written down in this file,
     which is the uncomfortable part worth keeping.
+
+15. **Design markup: the id is whole where it is read, and never replaced by a
+    name** (`test_web_design.py`) — the two constraints the designer stated for
+    `app/design.py` (room plan #12), asserted against rendered markup because
+    that is what they are claims about.
+
+    `app/design.py`'s subject *is* the renderer — each component takes plain data
+    and returns an HTML string — and `app/web.py:164-173` composes them by passing
+    the server's values straight down. That trace is what makes the fixture
+    honest: `name` is the server's `owner_id` and each activity row's label is its
+    `counterparty_owner_id`, so the component is the injection surface, and a
+    hostile string handed to `wallet_header(name=...)` here is the same string the
+    server would hand it. *Which* component appears on which page is
+    `test_web_accounts.py`'s subject, not this file's.
+
+    Three things worth recording, because each was a correction rather than a
+    first draft:
+
+    (a) **The spec and the module disagree, and the row is on the module's side.**
+    `DESIGN-SPEC.md:362` says the header id is *truncated* with the full id in a
+    `title` attribute; `app/design.py:413` renders the address whole and its
+    `title` is the static string `"Account ID"`. The module and the designer's
+    instruction agree with each other, so the spec row is the artifact raised to
+    the planner as the discrepancy. **Ruled** (planner, `600f2b9e`): the spec
+    sentence is the stale artifact, the row certifies the **module**, and the
+    designer is not to be asked to change working code. If the spec ever becomes
+    the live intent, `test_the_header_shows_the_address_whole` is the row that
+    fails, and it is meant to.
+
+    (b) **A row I wrote from an inference, and the measurement that refuted it.**
+    The first version of the switcher row asserted the `aria-current` entry had
+    *no* full-id affordance, inferred from its having no `title`. It failed: the
+    entry carries the id percent-encoded in its `href`. The row is now
+    `test_the_full_id_stays_reachable_in_both_switcher_branches` and asserts the
+    measured property in both branches — the plain entry through `title`, the
+    active entry through `href` — so the check's shape is on the record instead of
+    in the author's head.
+
+    (c) **The `_esc` mutant carries a hostile fixture, or it is inert.** Removing
+    an escaper changes nothing if nothing in the data needs escaping, so a mutant
+    run against names like `acct-abc123` would be green for a reason unrelated to
+    escaping. The fixture carries `<script>`, `"` and `&` through `owner_id` and
+    `counterparty_owner_id` specifically, and each mutant **asserts its own
+    premise** — that the defect it injected reached the output — before it asserts
+    the effect.
+
+    (d) **One row is about a coupling between two components, not about either
+    one** (designer, `101dc286`). Every other row here hands one component its
+    data and reads that component's output. The last pair is different in kind:
+    the header is the *only* place the active account's id is **readable**, because
+    the switcher's active entry carries it only percent-encoded in an `href` and
+    has no `title` at all. An `href` is machine-reachability, not
+    reader-reachability — so if the header ever truncated again, every
+    single-component row above would stay green while the account's own id became
+    unreadable on a touch screen. `test_the_active_id_is_readable_on_the_wallet_page`
+    therefore measures the **real composition**, `app/web.py:render_wallet` (the
+    function the server calls at `:422`), with an `HTMLParser` that separates body
+    **text nodes** from **attribute values** — the distinction the claim is about.
+    Its falsifier patches `app_web.wallet_header` to truncate and asserts its own
+    premise first: the id must still be in `attrs` (machine-reachable) and must be
+    absent from `text` (readable), or the mutant is measuring a page that *lost*
+    the id rather than one that hid it.
+
+    Every constraint is paired with a permanent in-gate falsifier that injects the
+    defect into the *real* component's own output and runs the same predicate
+    function the direct row uses, so a green falsifier is evidence about the
+    predicate rather than about a re-typed copy of it. Separately, and not as gate
+    evidence, all four defects were confirmed to redden the direct rows from a
+    **source-level** edit to a copy of `app/design.py` (header truncation, escaping
+    removed, the activity title dropped, the switcher title dropped) — in-test
+    string surgery on output and a real broken renderer are different claims, and
+    only the second one is about the module.
+
+16. **C3.7's negative: the create-success document announces no welcome**
+    (`test_web_accounts.py`) — the plan's own checkable form, "the create-success
+    document contains no occurrence of `welcome` (case-insensitive)", asserted at
+    the gate so the ratified decision cannot regress silently.
+
+    The two rows are `test_the_create_success_document_announces_no_welcome` —
+    which creates an account over the real stack, follows the 303 to the document
+    it lands on, and searches it, plus the wallet GETs, through one shared
+    predicate `_welcome_occurrences` — and
+    `test_the_no_welcome_row_fires_on_a_grant_announcement`, which patches
+    `app.web.create_form` to append the ruled-out copy (C3.7(a)'s shape: a note on
+    the create form) and requires the **same predicate** to report it. The
+    falsifier asserts its own **premise** first — the injected copy must reach the
+    served document — because this file has already once been fooled by an inert
+    mutant whose silence read as a pass.
+
+    Three things worth recording:
+
+    (a) **The row is deliberately not vacuous, in two independent ways.** The
+    landed-on document must be the new account's real page (`_active_account`
+    reads the address element; the balance element must render
+    `format_minor(OPENING_GRANT_MINOR, "USD")`, computed rather than spelled), so
+    an error page or a stub cannot be "no welcome" by emptiness; and the
+    falsifier supplies a document that *does* carry the copy.
+
+    (b) **The plan's checkable form is a raw substring search, so the fixture has
+    to stay out of its own way.** The first draft used the fixture name
+    `t14-welcome-owner` and went red **on correct code**: the occurrences it found
+    were the user's own account name, echoed into the `<h1>` and the switcher. The
+    negative is a property of the app's *copy*; the fixture name is now neutral
+    (`t14-owner`), and the boundary is written into the row's docstring rather
+    than left as an accident of the fixture. A creator who names their account
+    "welcome" would still redden the literal search — that is a fact about the
+    check's shape, raised as such, not a defect in the implementation.
+
+    **The direction of that defect is one-way, and it is worth stating because it
+    is what makes the row safe to keep.** A search over the whole rendered
+    document can only ever report too **many** occurrences: anything the app puts
+    on the page is inside the string being searched, so the search cannot miss
+    copy that is present. It over-reports (a legitimate use of the word, the
+    user's own name); it does not under-report. So a red from this row is a claim
+    about the *fixture* until the rendered document is read, while a green is a
+    real statement about the served bytes. An *alias* collision — the account name
+    carrying the copy — can therefore only move this row toward a false positive,
+    never toward a false negative, and the row's green half is not weakened by it.
+    The same is not true of element-scoped rows, where the scope can silently
+    exclude the very node the defect lives in; those need the exclusion written
+    down instead (obligations 13 and 15).
+
+    (c) **What the row does not cover.** Documents the UI does not assemble —
+    the stdlib `send_error` pages named in obligation 13's boundary note — and any
+    HTML not produced by `app/design.py`'s components. The claim is the covered
+    set.
+
+17. **The kill-and-resume scenario's verdict, in the gate**
+    (`test_kill_and_resume_coverage.py`) — T33, and the reason it exists is a
+    *membership* fact rather than a missing assertion. `app/selfcheck.py` is not a
+    gate phase (`run_gate.sh:138-139` is `api.selfcheck`), and its scenario
+    functions reach the gate only through a `tests/` row that calls them. Until
+    this file, the only such caller was `tests/test_persist_ordering.py`, and it
+    calls `scenario_web_ui` and nothing else — so
+    `app/selfcheck.scenario_kill_and_resume`, **including its mutant run that must
+    double-debit**, sat outside every green run quoted in this room. A regression
+    on that path was invisible to the gate whether or not its rows read green.
+    `app/selfcheck.py`'s own docstring asks for this row in as many words.
+
+    The row asserts the scenario's verdict over the scenario's **own** rows: both
+    runs (`mutate=False` and `mutate=True`), bounded by an index slice taken
+    around the calls, every label checked to be one of the scenario's two. It
+    re-asserts none of the scenario's conditions and copies none of them — the
+    owner keeps the assertions, this file makes them gate-visible.
+
+    Non-vacuity is asserted rather than assumed: the slice is judged by one
+    shared predicate, `_slice_problems`, which requires it to be non-empty, to
+    contain only this scenario's labels, to contain **both** runs, to contain the
+    row the falsifiers attribute to — and, per run, to hold **at least** the
+    breadth recorded in `MIN_ROWS` (9 normal, 6 mutant; measured 2026-10-05 against
+    `app/selfcheck.py 1fbfdbee0c49f777`, where both runs sat **exactly** on the
+    floor, so a one-row removal has no slack to hide in — re-counted at
+    `ce42ba10` on the way there and at `54c300040059ed4b` when the row was first
+    written, 9 / 6 at all three, the same breadth across three revisions of the
+    file). That last clause is the one that matters most
+    and it came from the integrator (`59427f8b`): the coverage that existed before
+    this file was a blanket all-green assertion, and that form stays green when a
+    row quietly **disappears** — so a scenario could be narrowed with nothing to
+    show for it. A floor rather than an equality, so the owner adding rows does not
+    redden this file and a removal does.
+
+    Two falsifiers, one per failure shape, and the report keeps them apart because
+    they are different defects:
+    - **a row goes red** — a store-loss mutant (the parent's view of the pending
+      store reports no outstanding record while the record is really on disk)
+      must flip exactly **one** row, `SURVIVING_RECORD_ROW`, and the report must
+      name it as failing without calling it a narrowing;
+    - **a row disappears** — `_check_swallowing_a_row` drops one of the normal
+      run's rows, so the scenario makes one fewer assertion and every assertion it
+      still makes **passes**. The coverage row must still redden, and the report
+      must say *narrowed* without inventing a failure.
+
+    Each premise is measured before its effect (the real reader sees the record the
+    mutant hides; the swallowed row really was swallowed), so an inert mutation
+    cannot make a guard's silence look like a pass.
+
+    Boundary: this covers the two runs `main` makes of this scenario and nothing
+    else in that file. `run_local_checks` and the web scenarios remain outside the
+    gate — the rest of `app/selfcheck.py` is the owner's runnable evidence, not
+    enforcement, and saying "the gate is green" still does not mean "the repo is".
+
+18. **An account id is opaque, and a refusal names what it refused**
+    (`test_web_accounts.py`, classes `AccountIdsAreOpaqueInAPath` and the
+    taken-address rows of `AccountsAndSwitching`) — T41 and T42, and they share
+    one shape: a **string the API accepted** being turned into something else on
+    the way to a human.
+
+    **The id.** `app/client.py` builds `/accounts/{id}/balance` and
+    `/accounts/{id}/activity` by interpolation, and a URL path segment is not an
+    account id. Three failure shapes, and only the first is "no answer": a space
+    or a control character raises `http.client.InvalidURL` inside urllib so the
+    request is never sent; `/`, `?` or `#` re-cut the path onto a different
+    route; and a `%` makes the server decode the segment one time more than the
+    caller meant, so an id that looks like the encoding of another id **reads
+    that other account, with a 200**. The rows create two accounts that are each
+    other's trap (`acct a b` owned by `alice`, `acct%20a%20b` owned by
+    `mallory`) and require each to read back as its own — keyed on `account_id`
+    and `owner_id`, never on the amount, because a retarget that landed on the
+    same balance would slip past a figure.
+
+    Each of the two call sites has its own falsifier, and each asserts its
+    **premise as the retarget itself** — an answer came back for the *other*
+    account — rather than as "the read raised". That distinction is the finding:
+    a mutant producing only `InvalidURL` would satisfy "the row went red" while
+    leaving the silent wrong-account read in place. Under each mutant the sibling
+    site is asserted still quoting, so one site reverted means one row red and
+    the attribution is exact. The mutants are built by `inspect.getsource` of the
+    landed method with `quote` rebound to the identity, not retyped, so they
+    cannot drift from the body they mutate and they revert exactly one site.
+
+    Boundary: this stays **client-side**. `%20` in a path segment *is* a space
+    (RFC 3986), so decoding it at the server is correct and hardening the parser
+    against it would be a regression. And `tests/test_web_accounts.py`'s own
+    `RecordingTransport` asserts an **unquoted** path
+    (`urlsplit(url).path == f"/accounts/{self.account_id}/balance"`), green only
+    because its fixture id is legal — a trap for the next row that reuses that
+    fixture with a non-safe id, recorded here rather than left to be discovered.
+
+    **The refusal.** Two names can derive one address (`Grace Hopper`,
+    `grace  hopper` and `Grace-Hopper` all render `acct-grace-hopper`), so a
+    create refusal whose subject is the *name* is describing something that is
+    not taken. The `name_taken` redirect therefore carries the address in its own
+    parameter and the create card renders it. The row asserts the **composition**
+    and no wording at all — the address travels in its own parameter, it is the
+    address the server actually created (read from the first create's landed
+    page, not re-derived, so a derivation that moved cannot make the row agree
+    with itself), and the create card's banner is where it lands. A sibling row
+    pins the explicit-id refusal (`account_exists`), so the address sentence
+    cannot pass by flattening both branches into one.
+
+    The read is scoped twice, and both scopes are load-bearing: `banner--error`
+    is emitted by page-level banners too, so the class alone is not
+    discriminating; and a document-wide search for the *address* is green on the
+    broken tree because `wallet_header` carries the active id in a `title`
+    attribute. The row reads the `section#create`, then the banner inside it,
+    then the text node.
+
+    Red-first was **not** available here: `app/web.py` landed the fix before the
+    row could be written. The substitution is stated plainly rather than papered
+    over — the red is delivered by an in-gate mutant that restores the pre-fix
+    rendering (the static copy, no address, no placeholder) and leaves every
+    other line of the landed code in place, with its premise asserted first so an
+    inert patch cannot make the row's red read as proof.
 
 ### Scoping rule
 

@@ -357,15 +357,42 @@ label, degrade honestly when it is absent*.
 
 | State | Treatment |
 |---|---|
-| name available | Primary label = the server's `owner_id` (or a future `display_name`), title-cased **only if** it is not an opaque token. |
+| name available | Primary label = the server's `owner_id` (or a future `display_name`), **rendered verbatim**. |
 | name absent (today's read path) | The heading becomes the neutral **"Account"** and the address carries the identification, with a quiet "This account has no name yet." line. A raw `acct-…` id is **never the largest thing on the page** (`plan.md` §C3.1), so the id is not promoted into the heading to fill the gap. **No invented name.** |
-| id always | Shown as the secondary line in mono, truncated, with the **full id in a `title` attribute** and a copy button (`⧉`, `aria-label="Copy account ID"`, 44×44 target). The id is the capability, so it must stay reachable and copyable. |
+| id always | **Whole in the header**, mono, as the secondary line, with a copy button (`⧉`, `aria-label="Copy account ID"`, 44×44 target); **truncated only in lists**, where the full id stays in a `title`. The id is the capability, so it must stay reachable and copyable. |
 | long name (>28ch) | Truncate with ellipsis in the primary line; full text in `title`. |
 | unknown account (API 404) | The existing dedicated error document (`app/web.py:360-365`), restyled to §5.7. Never a blank card. |
 
-**Title-casing rule.** `"alice"` → `"Alice"`. A 32-char hex string is **not** title-cased —
-it is shown as an id. Do not prettify an opaque token into a fake name; that is the same
-class of lie as inventing one.
+**Naming rule — WITHDRAWN as written, 2026-10-05, seen against the live page.** This section used to
+say *"`"alice"` → `"Alice"`"*, title-casing the name unless it looked like an opaque token. **The live
+page renders `alice` verbatim and the module is right; the rule was mine and it was wrong.** Three
+reasons, in order of weight: (1) the name is now the **identifier** (§C3.1, and the derived account
+id comes from it), so changing how it displays means the display no longer matches the thing people
+address; (2) it is **user-supplied** — someone who types `alice` may mean a handle, and `Alice` is a
+different string that they did not type and cannot predict; (3) title-casing is **lossy and
+locale-dependent** — `IBM` → `Ibm`, `van der Berg` → `Van Der Berg`, and scripts without case are
+rewritten by a rule that does not apply to them. This is the *same* rule the section already
+carried, applied consistently rather than only to hex: **do not prettify what someone typed into
+something they did not.** A name is not a label and must not be normalised into one.
+
+**Corrected 2026-10-05 — this row previously said the header id was truncated, and the module
+was right, not the spec.** Raised by the test-author, whose row `test_the_header_shows_the_address_whole`
+(`tests/test_web_design.py:175`) certifies `app/design.py:413` rendering the address whole with a
+static `title="Account ID"`. The design reason the module's behaviour is the correct one: the header
+is the only place the **page body** shows the address in a form a user can read and copy, and
+`title` does not exist on a touch screen — so a truncated header with the full value hidden in a
+tooltip would leave the account's own capability unreadable **and uncopyable** on the device most
+likely to be used. Truncation belongs to lists, which are wide and repeat the id across rows.
+
+**Precision added the same day, because the first version of this note over-claimed.** It said the
+header is the only place a user reads their own address. It is not: `_document` (`app/web.py:191`)
+builds the title as `f"Pocketful — {account_id}"`, so the full id is also in the browser tab, where
+it stays visible on mobile. The accurate statement is narrower and is the one that matters: **the
+header is the only carrier a user can read as page content and copy.** If the header truncated, the
+id would survive in the tab title (visible, not selectable) and in the active switcher entry's
+`href` (followable, not readable) — the page would not *lose* the id, it would lose the ability to
+*use* it. A row asserting "the id is readable on the page" must therefore say which surface it
+means, and one that parses only the body will not see the title at all.
 
 **Superseded — the switcher is IN (`plan.md` §C3.3, §C4).** An earlier draft of this section
 designed the switcher out, on the grounds that a list of "your accounts" needs client-side
@@ -432,7 +459,7 @@ it stops competing with Send. Expanded:
 |---|---|---|
 | Owner | **"Account name"** | Required. This is the value that will become the account's display label. Helper: *"Shown wherever this account appears."* |
 | Currency | "Currency" | Default `USD`. |
-| Account id | "Account ID (optional)" — under an **"Advanced"** disclosure | Today's helper text `blank, or an id you choose` is the confusing part. Replace with: *"Leave blank to get a random ID. If you choose one, it is how people will address this account — and anyone who knows it can act as this account."* That last clause is the `DEMO_NOTICE` model restated at the point of decision. |
+| Account id | "Account ID (optional)" — under an **"Advanced"** disclosure | Today's helper text `blank, or an id you choose` is the confusing part. Replace with: *"Leave blank and an ID is derived from the name. If you choose one, it is how people will address this account — and anyone who knows it can act as this account."* That last clause is the `DEMO_NOTICE` model restated at the point of decision. |
 
 | State | Treatment |
 |---|---|
@@ -512,6 +539,41 @@ the words are not.
 
 - `debit` amount colour `--text`; `credit` colour `--ok-text`. **Both also carry the explicit
   `+`/`−` glyph**, so colour is never the only channel.
+- **The word and the sign must agree, and this is now gate-enforced.** Added 2026-10-04
+  (`app/selfcheck.py`, `[WEB] each activity row's direction word agrees with its amount's
+  sign, both read from the same <tr>`): each `<tr>` is read on its own and the `What` word is
+  checked against the sign in that same row, with at least one row of each direction required
+  so a page that stopped rendering debits cannot pass vacuously. A presence check would have
+  passed a row rendering the *wrong* word; **disagreement is the hazard, not absence.** The
+  paired falsifier flips one row's word and requires the check to red — and because the flipped
+  row is the only row in that render, a page- or column-scoped form of the same assertion would
+  have had nothing to be satisfied by, which is what shows the row-scoping does work rather
+  than decorate the label.
+
+**The minus glyph has two forms in this product, and they are not the same character.** Measured
+2026-10-05 by rendering one page with a negative balance and a debit row: `app/design.py` signs a
+debit with **U+2212 MINUS SIGN** (`−$100.00`), while `app/money.py:format_minor` signs a negative
+with **U+002D HYPHEN-MINUS** (`-$100.00`). Both appeared in that single rendered document. This
+is reachable: `format_minor` is the balance formatter, an ordinary account can never go negative
+(`ledger/core.py:349` raises `InsufficientFunds` unless `allow_overdraft`), and the one account
+that *does* carry `allow_overdraft` is the system account — whose page therefore shows a
+`format_minor` balance next to `−`-signed activity rows. `_resolve_account` (`app/web.py:218`)
+validates nothing, so `?account=__system__` renders it.
+
+**Ruling: U+2212 is the product's minus, everywhere.** It is the character designed for numeric
+display — it matches the width of the digits and of `+`, where the hyphen is short and sits high
+— and §5.6's own table above already specifies `−$2.50`. `format_minor` is the outlier, not the
+activity table. The change is one character in `app/money.py` plus the assertion at
+`app/selfcheck.py:869` (`format_minor(-5) == "-$0.05"`), which moves with it; `format_minor`'s
+output is display-only (`parse_amount_to_minor` rejects signed input, asserted at `:855-865`), so
+nothing round-trips through the glyph. **Status: reported to the Frontend Engineer, who owns
+`app/money.py` — not carried out by me.** Note the new row deliberately accepts both glyphs
+("the claim is the agreement, not the glyph"), which is the right scope for that row but means
+**nothing in the gate pins the glyph**; settling it is a hand decision, and either way the row
+stays green. One honest counter-argument, recorded rather than dismissed: an ASCII hyphen is
+announced as "minus" by the widest range of screen readers, and U+2212 is the newer convention —
+so if this is settled the other way, the activity table is the half that changes, and the
+spec's table above changes with it.
 - Keep `<caption class="sr-only">Activity</caption>` and `scope="col"` on headers.
 - **Empty state** (§5.8) replaces `No activity yet.` in a cell with a real block.
 - Keep the footer note: *"Balance and activity are the server's values, shown verbatim."*
@@ -725,7 +787,7 @@ All strings LTR, sentence case, no exclamation marks, no "Oops".
 | Retry guarantee | `Pressing Retry reuses the key already stored on the server — it cannot create a second transfer.` |
 | Create heading | `Create an account` |
 | Owner field | `Account name` · helper `Shown wherever this account appears.` |
-| Account id (advanced) | `Leave blank to get a random ID. If you choose one, it is how people will address this account — and anyone who knows it can act as this account.` |
+| Account id (advanced) | `Leave blank and an ID is derived from the name. If you choose one, it is how people will address this account — and anyone who knows it can act as this account.` |
 | Create button | `Create account` |
 | Create note — **grant absent** | `Creating an account mints no key and moves no money.` |
 | Create note — **grant live** | *(withdrawn 2026-10-04 — §5.8: the grant is USD-only while the form lets the user pick a currency, so any grant note is false for a non-USD choice. The activity row is the welcome.)* |
@@ -739,6 +801,48 @@ All strings LTR, sentence case, no exclamation marks, no "Oops".
 ---
 
 ## 9. Blocked, and needing a decision elsewhere
+
+**D. The blank-address path derives the id from the name, so the only credential is guessable.
+Raised 2026-10-05; RULED the same day — the price is ACCEPTED, and I was wrong about the
+alternative.**
+Measured: `_derive_account_id` (`app/web.py:258-280`) is `"acct-" + slug(owner_id)` with no
+random component — the gate's own output shows `acct-grace-hopper`. `DEMO_NOTICE`
+(`app/web.py:105`) states *"an account id is the only credential"*. So the credential is now a
+**pure function of the account's display name**, a name that is public, human-readable and
+guessable: `acct-alice`, `acct-bob`, `acct-grace-hopper`. Anyone who can guess a name can reach
+that account. (The no-ASCII fallback, `"u" + sha256(name)[:12]`, is still a function of the name,
+so it has the same property.) This is a regression against the intent §5.4 wrote down, not a
+pre-existing condition: an *attacker* could always choose `acct-alice`, but a *victim* used to get
+one the attacker could not derive.
+
+**RULED 2026-10-05 (plan) — the guessability price is ACCEPTED.** §C3.1 makes the name the
+identifier, and `DEMO_NOTICE`'s own sentence, *"anyone who knows it can act as this account"*, says
+as much on every page — so a guessable address is not an authentication factor in this product.
+This item is answered rather than pending. What remains open is the Ledger Engineer's half: whether
+§C2.1 wants server-minted ids at all.
+
+**And I was wrong about the alternative, in a way worth keeping.** I argued that form-carried
+randomness would preserve the exactly-once guard, on the premise that *a fresh render follows a
+create that did not succeed*. That premise is false, and the Frontend Engineer showed why: a create
+can succeed and the browser never see it — the POST opens the account and posts the `$100`, and the
+303 is lost. The user reloads `GET /`, the page they know, which mints a **new** id on the fresh
+render, and submits the same name again. Form-carried randomness opens a second account with a
+second `$100`; derived earns the 409, because its id is a function of **what the user re-typed**,
+not of state the client had to still be holding.
+
+That is the real principle, and it is sharper than "determinism is good for retries": **the id must
+be a function of the input guaranteed to recur.** The client can lose what it holds — a lost 303, a
+closed tab, a cleared cookie — and the typed name is the one thing that comes back. Any scheme
+deriving the id from something the client must still be *holding at retry time* has that same
+window, and no care about per-attempt minting closes it.
+
+**Copy consequence, ruled and landed:** the mechanism string follows the mechanism, and the
+mechanism derives — settled now, not provisionally. §5.4 and §8 read *"Leave blank and an ID is
+derived from the name."*, matching `app/design.py:503` and `plan.md` §C3.2. The warning clause
+beside it stays, and matters **more** under derivation than it would under randomness: *"anyone who
+knows it can act as this account"* was written for an id you had to be *told*; under derivation it
+is an id that can be *worked out*. The ledger's `DEMO_NOTICE` covers the consequence; this clause
+is the same fact stated at the point of decision, which is where a user can still act on it.
 
 **A. The `$100` copy is blocked on the ledger.** **RESOLVED 2026-10-04 — and the resolution
 removed the copy rather than unblocking it: §5.8 decision (c) rules that there is no welcome

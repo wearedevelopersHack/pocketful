@@ -4,9 +4,19 @@ Owned exclusively by **deploy-engineer** (plan §4). Disjoint from `ledger/`,
 `api/`, `app/`, `tests/`, `run_gate.sh`. Nothing here is imported by the
 application; these are operator procedures.
 
-There is **no version control** on the dev machine or on the host. The working
-tree is the truth and the board is the only history, so every procedure that is
-worth keeping lives here as a file rather than in a transcript.
+**Version control exists now — as of 2026-10-04, not when this file was
+written.** Measured 2026-10-05: the dev machine has `~/.local/bin/git`
+(2.53.0, a root-free extracted `.deb` — there is still no *system* git, and
+`sudo` needs a TTY), and the prod host has `/usr/bin/git`.
+`scripts/git-sync.sh` (written 2026-10-04 23:07) snapshots the working tree
+into commits.
+
+**None of that changes a procedure below. A commit is not a release.** The
+deploy path transfers directories, systemd runs `/srv/pocketful/current`, and
+no commit has ever been deployed to the host. The rollback is still a preserved
+release directory — *not* `git revert` — and the working tree is still the
+truth for what gets staged. Every procedure worth keeping still lives here as a
+file rather than in a transcript.
 
 ## Host facts (observed, not assumed)
 
@@ -359,3 +369,106 @@ fixture under `TMPDIR`. The coherent explanation is **live traffic through the p
 send writes the ledger and mints a pending key. That is the application working, and the store
 holding a pending record is exactly the state the T16 rehearsal proved survives both a swap and a
 revert. **No boot step may clean it up.**
+
+### Divergence reopened 2026-10-05 — the tree has moved on; the live release has not
+
+Both pins recomputed here, not quoted:
+
+| pin | live release `6c766987` | working tree now |
+|---|---|---|
+| 3-tree (release) | `04c16b73699da3e52147be8f7b995b88ae94d6abfe2c0d6793df91cacbaf2f45` | `a7f269cb5a1d9b36260570e686e1e559cd7ede5e32e1a15ecde832954175cbab` |
+| 4-tree (gate) | — (`tests/` is never shipped) | `6b249d0f998a6629acb92d229a0e74c9365718c91da7223aac77eead2b0d3956` |
+
+Since the final ship, `api/`, `app/` and `tests/` have all changed: the
+client-supplied account id (§C2.1), the opening grant, the activity owner
+column. `tests/` now holds **100** test definitions, against 72 at that ship.
+
+**This is the normal state between ships, not a defect.** The site is correct
+for the revision it runs; it is simply behind. The rules are unchanged: the
+next ship is a **new** revision, gated afresh from the settled tree — never a
+re-cut of `6c766987`, never a copy of whatever the working tree happens to
+hold.
+
+**One consequence to name:** nothing added since the final ship is on the site.
+Anyone verifying a change through a browser is verifying `6c766987`.
+
+### `ops/smoke.sh` was broken by §C2.1, and is fixed here
+
+The pre-gate smoke test POSTed `{"owner_id","currency","allow_overdraft"}` with
+no `account_id`. Once §C2.1 made the id required and client-supplied, the API
+answered `400 {"error":"invalid_request"}`, the parser read an empty id, and the
+script died at line 40 — **on every run, before reaching the app at all**.
+
+The body now sends a **per-run unique** id. A fixed one would have been worse
+than the bug: because the id is the ledger's exactly-once guard, a literal
+`acct-smoke` passes once and then returns `409 {"error":"account_exists"}`
+forever. The script also asserts the id comes back **unchanged**, since a server
+that quietly mints its own is the regression this test exists to catch.
+
+Verified 2026-10-05 on the current tree: two consecutive runs, `exit=0` both,
+two distinct accounts. And verified to *have teeth* — against a copy of `api/`
+patched to ignore the caller's id, it exits 1 with
+`SMOKE FAIL: asked for acct-smoke-…, got server-minted-id`.
+
+Note the script opens one throwaway account in whatever database it is pointed
+at and does not remove it. Running it with the default `DB` writes a
+grant-carrying row to **production**.
+
+### T26 ship 2026-10-05 — revision `5df83d92`, divergence CLOSED
+
+| | |
+|---|---|
+| 4-tree gate pin (dev-only) | `5df83d92820d79edec518482150d46ff7b7295c1f561ad576c3a13990ee372f1` |
+| 3-tree release pin | `559481459beac10b18b01059f9f4a978b1c422b6842fcf883e21bed720570243` |
+| release dir | `/srv/pocketful/releases/5df83d92` |
+| superseded | `6c766987` → preserved as `6c766987.prev` |
+| armed rollback | `/srv/pocketful/releases/6c766987.prev` |
+
+**Binding.** The four-tree pin was recomputed here and matched the gated value exactly, and all
+seven per-file digest prefixes matched, so the staged revision *is* the gated revision. The fix
+this revision carries was read rather than assumed: `app/client.py:125` and `:131` both carry
+`quote(account_id, safe='')`.
+
+**Both pins matter and neither substitutes for the other.** The host has no `tests/`, so the
+four-tree value **cannot** be reproduced there — asking for it would manufacture a false mismatch
+that looks like a moved tree. Compare the three-tree value on the host.
+
+**Staged bytes == gated bytes** before the pointer moved (3-tree pin identical, dev and host).
+
+**Live after, measured from outside:**
+```
+GET https://pocketful.getn.space/          -> 200  text/html; charset=utf-8  13399 bytes
+served /srv/pocketful/current/app/web.py   -> 6c452b5501697d28…   (== the tree's)
+```
+
+**The fix exercised end to end on the live site.** An account id that genuinely needs encoding —
+`probe 5df8/1`, containing a space and a slash — was created and read back:
+```
+POST /create     -> 303   Location: /?account=probe%205df8%2F1
+GET that URL     -> 200, title "Pocketful — probe 5df8/1",
+                    name="account" value="probe 5df8/1", $100.00, __system__ opening-grant credit
+control: ?account=definitely-not-real -> 200 but 10112 bytes (the unknown-account state)
+```
+So both patched call sites are covered by a live request: `:125` by the balance, `:131` by the
+activity. Without the fix the slash would have split the path. Note the control: an unknown
+account also returns `200`, just a smaller page — status alone would not have distinguished them.
+
+**Rollback rehearsed against this ship's own armed target**, not cited from a previous ship:
+```
+current -> 6c766987.prev   served app/web.py 686368f3…   units active   GET / 200
+current -> 5df83d92        served app/web.py 6c452b55…   units active   GET / 200
+```
+
+**Store untouched across the whole window** — swap, revert and roll-forward:
+```
+sha256 470590c509a063f6193a7362333be2b57e01b3a5dea5d13e91c2edba68585001
+892 bytes  mode 600  mtime 2026-10-04 08:34:35 +0000
+```
+Identical to the pre-window baseline, with the mtime predating the window entirely — so neither
+restart so much as opened it for write.
+
+**Probe account left by this ship:** `probe 5df8/1` (the fix's own verification), carrying the
+§C2.3 opening grant. Play-money demo account, disclosed like the others.
+
+No nginx, TLS or DNS change in this deploy. `getn.space` and `www.getn.space` both still answer
+`200`. **The 2026-10-05 divergence recorded above is CLOSED by this ship.**

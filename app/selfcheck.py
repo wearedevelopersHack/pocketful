@@ -205,15 +205,16 @@ class _SyntheticFaultTransport:
 
 
 def _ui_call(host: str, port: int, method: str, path: str,
-             form: dict | None = None) -> tuple[int, dict, str]:
+             form: dict | None = None,
+             headers: dict | None = None) -> tuple[int, dict, str]:
     payload = None
-    headers: dict[str, str] = {}
+    sent: dict[str, str] = dict(headers or {})
     if form is not None:
         payload = urllib.parse.urlencode(form).encode("utf-8")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        sent["Content-Type"] = "application/x-www-form-urlencoded"
     conn = http.client.HTTPConnection(host, port, timeout=15)
     try:
-        conn.request(method, path, body=payload, headers=headers)
+        conn.request(method, path, body=payload, headers=sent)
         try:
             response = conn.getresponse()
         except (http.client.HTTPException, OSError):
@@ -247,6 +248,12 @@ _UUID_ANY = re.compile(
 # document is only accidentally true.
 _BALANCE_ELEMENT = re.compile(
     r'<p class="balance">(?:<span[^>]*></span>)?\s*([^<]*)</p>')
+
+# The switcher's own witness for "remembered but unknown" (§C3.4). Element-scoped
+# for a reason measured the hard way: `.switcher .unavailable` is a CSS rule in
+# every page's <style>, so ``"unavailable" in page`` is satisfied by the
+# stylesheet whatever the switcher rendered.
+_UNAVAILABLE_SPAN = re.compile(r'<span class="unavailable"[^>]*>(.*?)</span>', re.S)
 
 # One activity row's direction word and its amount, read from the SAME <tr>.
 #
@@ -386,7 +393,19 @@ def scenario_kill_and_resume(base_url: str, workdir: str, funder: str,
     store_path = str(Path(workdir) / ("store-mutant.json" if mutate else "store.json"))
     label = "MUTANT (fresh key on retry)" if mutate else "NORMAL"
 
-    sent = _spawn_child("--child-send", base_url, store_path, payer, payee, "500")
+    # The fixture — not this scenario — decides what these accounts open with:
+    # §C1's opening grant posts 10000 to every account the caller creates, on top
+    # of whatever it funds. So the assertions below are written as MOVEMENTS
+    # against these two readings. Literals standing in for the totals (9500/500)
+    # were unsatisfiable for any implementation once the grant landed, and a
+    # renumbered total can launder a double-spend into a passing row: a total no
+    # longer says which transfer moved the money.
+    baseline = ApiClient(base_url)
+    SEND = 500
+    payer_open = baseline.get_balance(payer)["balance_minor"]
+    payee_open = baseline.get_balance(payee)["balance_minor"]
+
+    sent = _spawn_child("--child-send", base_url, store_path, payer, payee, str(SEND))
     check(sent.returncode == -signal.SIGKILL,
           f"[{label}] the sender process was SIGKILLed mid-flight",
           f"returncode={sent.returncode}")
@@ -429,10 +448,12 @@ def scenario_kill_and_resume(base_url: str, workdir: str, funder: str,
         # The mutant mints a new key, so the server applies a SECOND transfer.
         # This is the money the naive implementation loses, and it is why the
         # normal-path assertion below is not vacuous.
-        check(payer_balance == 9000 and payee_balance == 1000,
-              f"[{label}] a regenerated key double-debits (payer 9000, payee 1000) — "
-              "the defect the next assertion catches",
-              f"payer={payer_balance} payee={payee_balance}")
+        check(payer_balance == payer_open - 2 * SEND
+              and payee_balance == payee_open + 2 * SEND,
+              f"[{label}] a regenerated key double-debits — the server applied the "
+              "transfer twice, and it is why the next assertion is not vacuous",
+              f"payer {payer_open} -> {payer_balance}, "
+              f"payee {payee_open} -> {payee_balance} (two transfers of {SEND})")
         return
 
     statuses = payload.get("statuses") or []
@@ -444,9 +465,10 @@ def scenario_kill_and_resume(base_url: str, workdir: str, funder: str,
           and settled.transfer_id == statuses[0].get("transfer_id"),
           f"[{label}] the record settled to the replayed transfer_id",
           f"{settled}")
-    check(payer_balance == 9500 and payee_balance == 500,
-          f"[{label}] balances moved exactly once: payer 9500, payee 500",
-          f"payer={payer_balance} payee={payee_balance}")
+    check(payer_balance == payer_open - SEND and payee_balance == payee_open + SEND,
+          f"[{label}] balances moved exactly once: one debit and one credit of {SEND}",
+          f"payer {payer_open} -> {payer_balance}, "
+          f"payee {payee_open} -> {payee_balance}")
 
     activity = client.list_activity(payer)["items"]
     debits = [item for item in activity if item["direction"] == "debit"]
@@ -708,6 +730,182 @@ def scenario_web_ui(base_url: str, workdir: str, payer: str, payee: str) -> None
               f"payee={client.get_balance(payee)['balance_minor']} "
               f"(open {payer_open}, sent {SEND} then {SECOND})")
 
+        # -- the create surface (plan §C3.2, §C3.3, §C3.4) ---------------------
+        #
+        # The form's advertised default path is "type a name, leave the address
+        # blank". Nothing drove it: every caller of /create passed an explicit
+        # account_id, so the hint and the behaviour were free to disagree — and
+        # they did, because the blank form asked the API for an account with no
+        # id, which §C2.1 refuses with a 400. These rows post what the form
+        # posts, and they measure the money the create moves rather than a total,
+        # so a renumbering of the fixture cannot launder a second grant.
+        NEW_NAME = "Grace Hopper"
+        system_open = client.get_balance("__system__")["balance_minor"]
+
+        status, headers, _ = _ui_call("127.0.0.1", port, "POST", "/create",
+                                      {"owner_id": NEW_NAME, "currency": "USD"})
+        create_location = str(headers.get("Location", ""))
+        check(status == 303 and create_location.startswith("/?account="),
+              "[WEB] the create form's default path — a name with the address left "
+              "blank — creates an account",
+              f"status={status} location={create_location!r}")
+
+        new_id = urllib.parse.unquote(create_location.partition("account=")[2])
+        status, headers, page = _ui_call("127.0.0.1", port, "GET",
+                                         create_location or "/")
+        element = _BALANCE_ELEMENT.search(page)
+        opened = client.get_balance(new_id)["balance_minor"]
+        check(status == 200 and element is not None
+              and element.group(1) == format_minor(opened, "USD"),
+              "[WEB] the account just created shows the server's balance for it",
+              f"element={element.group(1)!r} server={format_minor(opened, 'USD')!r}"
+              if element is not None
+              else "no balance element found (regex over class=\"balance\")")
+
+        # The opening balance is one double-entry movement, not a number the
+        # client produced: the new account's credit and the system account's
+        # matching debit are read from the server, and the second is asserted to
+        # be exactly the negative of the first.
+        system_now = client.get_balance("__system__")["balance_minor"]
+        check(opened > 0 and system_now - system_open == -opened,
+              "[WEB] the opening balance is one grant: the system account moved by "
+              "exactly its negative",
+              f"new={opened} system {system_open} -> {system_now}")
+
+        # The retry half of §C3.2, and the reason the derived id is a function of
+        # the name: a second submission of the same name must land on the API's
+        # 409 — never a second account carrying a second grant. An id minted per
+        # attempt would double this balance while every other row stayed green.
+        status, headers, _ = _ui_call("127.0.0.1", port, "POST", "/create",
+                                      {"owner_id": NEW_NAME, "currency": "USD"})
+        refusal_location = str(headers.get("Location", ""))
+        status_page, _, refusal = _ui_call("127.0.0.1", port, "GET",
+                                          refusal_location or "/")
+        again = client.get_balance(new_id)["balance_minor"]
+        check(status == 303 and refusal_location.startswith("/?error=name_taken")
+              and again == opened,
+              "[WEB] resubmitting the same name creates no second account and no "
+              "second grant",
+              f"location={refusal_location!r} balance {opened} -> {again}")
+
+        # ... and the refusal is rendered where the user can act on it: inside the
+        # create card, with the name still in the field. The slice runs from the
+        # card to the Activity heading, so an alert that precedes the card (the
+        # page-level banner) cannot satisfy it.
+        card_at = refusal.find('id="create"')
+        card_end = refusal.find("Activity</h2>")
+        card = refusal[card_at:card_end] if card_at != -1 and card_end > card_at else ""
+        check(status_page == 200 and NEW_NAME in card and 'role="alert"' in card,
+              "[WEB] a refused create answers in the create card, with the typing kept",
+              f"name_echoed={NEW_NAME in card} alert_in_card={'role=\"alert\"' in card}")
+
+        # The cookie (plan §C3.3): ids only, capped, Path/HttpOnly/SameSite, and
+        # carrying neither the name nor the balance it is meant to help find.
+        status, headers, page = _ui_call("127.0.0.1", port, "GET",
+                                         create_location or "/")
+        cookie = str(headers.get("Set-Cookie", ""))
+        raw_value = cookie.partition("=")[2].partition(";")[0]
+        try:
+            remembered = json.loads(urllib.parse.unquote(raw_value))
+        except (TypeError, ValueError):
+            remembered = None
+        attrs = ("Path=/", "HttpOnly", "SameSite=Lax")
+        check(all(attr in cookie for attr in attrs)
+              and isinstance(remembered, list) and new_id in remembered
+              and NEW_NAME not in cookie and "$" not in cookie,
+              "[WEB] creating remembers the id in pocketful_accounts — ids only, no "
+              "name and no balance",
+              f"cookie={cookie!r} decoded={remembered!r}")
+
+        # §C3.4: an id the server does not know renders as unavailable and is
+        # dropped on the next write — never with an invented balance.
+        ghost = "acct-no-such-account"
+        sent_cookie = urllib.parse.quote(
+            json.dumps([ghost, new_id], separators=(",", ":")), safe="")
+        status, headers, page = _ui_call(
+            "127.0.0.1", port, "GET", "/",
+            headers={"Cookie": f"pocketful_accounts={sent_cookie}"})
+        written = str(headers.get("Set-Cookie", ""))
+        unavail = _UNAVAILABLE_SPAN.search(page)
+        check(status == 200 and unavail is not None and new_id in page
+              and ghost not in urllib.parse.unquote(written)
+              and new_id in urllib.parse.unquote(written),
+              "[WEB] a remembered id the server does not know renders as unavailable "
+              "and is dropped from the cookie",
+              f"unavailable_span={unavail is not None} "
+              f"ghost_in_cookie={ghost in urllib.parse.unquote(written)}")
+
+        # §C3.4 says the page never crashes, and "an id the server does not know"
+        # was not the only way to break that. An id is opaque to this layer — the
+        # create form's own "or an id you choose" affordance lets a user type one
+        # — and before the transport quoted it, a typed space raised
+        # ``http.client.InvalidURL`` inside urllib from a branch that caught only
+        # ApiError/WalletProtocolError/OSError: the handler died with no status
+        # line, so the browser got a closed socket instead of the page the 303 had
+        # just promised. The id is asked for again on every later render (the
+        # active account is read, and every remembered id is probed), so one
+        # unusable id took down routes that had nothing to do with it. Both faces
+        # the reviewer reproduced are driven here: a space, and a ``%`` — which
+        # did not crash but was decoded by the server into a *different* id, so
+        # the real account rendered unavailable and was dropped from the cookie.
+        for typed_id in ("My Acct", "my%acct"):
+            status, headers, _ = _ui_call("127.0.0.1", port, "POST", "/create",
+                                          {"owner_id": "Typed " + typed_id,
+                                           "currency": "USD",
+                                           "account_id": typed_id})
+            typed_location = str(headers.get("Location", ""))
+            try:
+                served = client.get_balance(typed_id)["balance_minor"]
+                served_note = format_minor(served, "USD")
+            except Exception as exc:  # noqa: BLE001 — the row must fail, not error
+                served = None
+                served_note = f"{type(exc).__name__}: {exc}"
+            status_page, _, typed_page = _ui_call("127.0.0.1", port, "GET",
+                                                  typed_location or "/")
+            typed_element = _BALANCE_ELEMENT.search(typed_page)
+            check(status == 303 and served is not None and status_page == 200
+                  and typed_element is not None
+                  and typed_element.group(1) == served_note,
+                  f"[WEB] a typed address {typed_id!r} is addressable by the id the "
+                  "API accepted: the page answers with the server's balance",
+                  f"create={status} location={typed_location!r} get={status_page} "
+                  f"element={typed_element.group(1) if typed_element else None!r} "
+                  f"server={served_note!r}")
+
+        # The same defect reached without the form at all. `_remembered_account_ids`
+        # promises a hand-written cookie cannot smuggle a name in; before the fix
+        # "Cookie Probe" was enough to close the socket, so the promise was about
+        # the parser and not about the page. The id is unknown to the server, so
+        # the switcher renders it unavailable and the next write drops it.
+        #
+        # What this row *excludes*, measured under a transport with the id left
+        # unquoted: it goes red (`dropped=False`) — because `_probe_account`'s
+        # `except http.client.HTTPException` deliberately keeps an id it cannot
+        # ask about ("cannot ask" is not "not there", §C3.4), so the name
+        # survives into the cookie. The row is therefore evidence for the two
+        # layers together, not for the guard alone; a transport that cannot
+        # phrase the id is the one case where keeping it is the correct answer.
+        #
+        # And it cannot pin that clause, which the reviewer measured rather than
+        # argued: with `quote` in place at both client sites the path is always
+        # phraseable, so `app/web.py:461` is unreachable by construction — remove
+        # the `except http.client.HTTPException` clause alone, leave everything
+        # else byte-identical, and this scenario is **64/64**. The row reds on
+        # `dropped` only when the transport cannot phrase the id, and then on
+        # `status=500` instead if web.py has stopped keeping the entry. A second
+        # line, unpinnable by this row and by nothing else in the gate.
+        name_cookie = urllib.parse.quote(
+            json.dumps(["Cookie Probe"], separators=(",", ":")), safe="")
+        status, headers, page = _ui_call(
+            "127.0.0.1", port, "GET", "/",
+            headers={"Cookie": f"pocketful_accounts={name_cookie}"})
+        written = urllib.parse.unquote(str(headers.get("Set-Cookie", "")))
+        check(status == 200 and _BALANCE_ELEMENT.search(page) is not None
+              and "Cookie Probe" not in written,
+              "[WEB] a hand-written cookie carrying a name still gets a page, and "
+              "the unknown id is dropped",
+              f"status={status} dropped={'Cookie Probe' not in written}")
+
         # -- the eighth path: the exception nobody named -----------------------
         #
         # "Every branch redirects" was a claim about a list, checked by reading
@@ -866,7 +1064,7 @@ def run_local_checks() -> None:
             check(True, "a float is refused, never coerced into the money path")
         else:
             check(False, "a float must be refused")
-        check(format_minor(1234) == "$12.34" and format_minor(-5) == "-$0.05",
+        check(format_minor(1234) == "$12.34" and format_minor(-5) == "−$0.05",
               "display formatting is integer math at the edge",
               f"{format_minor(1234)} {format_minor(-5)}")
     finally:

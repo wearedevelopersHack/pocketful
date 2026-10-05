@@ -23,15 +23,26 @@ Three consequences, each deliberate:
   with a Retry button. ``POST /retry`` calls ``app.send.resume``, which re-sends
   the *stored* key. The browser supplies no key and no body — it only says
   "retry what you already have".
-* Rendering (``GET /``) never writes. Reloading the page cannot mint a key.
+* Rendering (``GET /``) mints no key and writes nothing to the store. Its only
+  output is the account-list cookie, which carries ids and no money at all (see
+  below). Reloading the page cannot mint a key.
 
-**Accounts are presentational and multi-account is stateless.** ``GET
+**Accounts are presentational, and the active account is not a cookie.** ``GET
 /?account=<id>`` renders that account's balance and activity; a bare ``GET /``
 and an empty ``?account=`` fall back to the boot ``--account``. The active
 account then rides with the POST that acts on it in a hidden ``account`` field
 resolved by :func:`_resolve_account` — the *same* helper the renderer uses, so
-the page and the action cannot disagree about who the sender is. It is not a
-cookie and not server state: the request carries it or it does not.
+the page and the action cannot disagree about who the sender is. The request
+carries it; neither the cookie nor any server state selects it.
+
+The one cookie, ``pocketful_accounts`` (plan §C3.3), exists so a browser can
+find its way back to accounts it has seen. It is a JSON list of **ids only**,
+capped at 12, and it is **never authoritative**: which account is active, every
+name, every balance and every activity row is read from the server, and an id
+the server does not know renders as *unavailable* — never with an invented
+balance — and is dropped on the next write (plan §C3.4). It does not touch the
+pending store, which stays one store and account-agnostic, so the keys a retry
+needs are still a file on disk and never something a cookie could lose.
 
 That is a change in kind, stated rather than implied: the field is
 client-supplied, so **an account id is the capability**. The UI no longer
@@ -57,13 +68,15 @@ connection and imports nothing from ``ledger/``.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
 import json
 import logging
 import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from .client import ApiClient, ApiError
 from .design import (STYLE, _esc, account_switcher, activity_table, banner,
@@ -143,7 +156,9 @@ values, shown verbatim.</p></footer>
 def render_wallet(*, account_id: str, balance_minor: int, currency: str,
                   rows: list[ActivityRow], pending: list,
                   message: str | None = None, notice: str | None = None,
-                  name: str | None = None, accounts: list | None = None) -> str:
+                  name: str | None = None, accounts: list | None = None,
+                  create_error: str | None = None, create_name: str | None = None,
+                  create_address: str | None = None) -> str:
     """Render the wallet view. Contains no idempotency key and no key input field.
 
     Every component is ``app/design.py``'s; this function only decides the order
@@ -167,7 +182,8 @@ def render_wallet(*, account_id: str, balance_minor: int, currency: str,
         account_switcher(accounts=accounts or [], active_id=account_id),
         send_form(action="/send", address=account_id),
         pending_block(pending=pending),
-        create_form(action="/create", name_value=None, address_value=None),
+        create_form(action="/create", name_value=create_name,
+                    address_value=create_address, error=create_error),
         '<section class="card card--wide">',
         '<h2 class="h2">Activity</h2>',
         activity_table(rows=rows),
@@ -205,14 +221,124 @@ _ERROR_MESSAGES = {
     "same_account_transfer": "You cannot send to the same account. Nothing was sent.",
     "invalid_idempotency_key": "The request was refused: invalid idempotency key.",
     "api": "The API did not answer. Nothing was sent.",
-    "missing_owner": "Enter an owner for the account you are creating.",
-    "account_exists": "That account id is already taken. Nothing was created.",
+    "missing_owner": "Enter a name for the account you are creating.",
+    "account_exists": "That account ID is already taken. Nothing was created.",
+    "name_taken": "That name is already taken. Nothing was created — pick another.",
     "invalid_account": "The API refused those account details. Nothing was created.",
     "invalid_request": "The API refused those account details. Nothing was created.",
 }
 
+# The one refusal whose *subject* is not in the table above. On the ``name_taken``
+# branch the name is free and the **address** is taken: two names can derive one
+# address ("Grace Hopper", "grace  hopper" and "Grace-Hopper" all render
+# ``acct-grace-hopper``), so a sentence that says the name is taken is describing
+# the wrong thing. The address is not knowable here — it exists only on the create
+# side, in ``_derive_account_id`` — so it arrives from the redirect in its own
+# parameter and is formatted in at the render site. Never a literal: a sentence
+# that bakes ``acct-grace-hopper`` becomes a false witness the moment the
+# derivation moves. ``_ERROR_MESSAGES["name_taken"]`` stays the fallback for a URL
+# that arrives without the address (see the lookup in ``_render_feed``).
+_NAME_TAKEN_TEMPLATE = ("That name's address ({address}) is already taken. "
+                        "Nothing was created — pick another name.")
+
+# Refusals that belong to the CREATE card rather than to the page. They are a set
+# rather than a property of the URL so the routing question ("which control was
+# this about?") has one answer: these codes are produced only by ``_handle_create``
+# — ``missing_owner`` and ``invalid_account`` are local to it, and a transfer
+# route has no 409 that means "that name is taken" — so a code in this set can
+# never be a send's, and a code outside it can never be a create's.
+_CREATE_ERROR_CODES = frozenset({"missing_owner", "account_exists", "name_taken",
+                                 "invalid_account"})
+
 _PENDING_NOTICE = ("The transfer could not be confirmed and is recorded as pending. "
                    "Nothing was sent twice. Press Retry to try again with the same key.")
+
+
+# -- accounts: deriving an address, and remembering the ones this browser saw ---
+
+# plan §C3.2: creation asks for a NAME, and when the address is left blank the
+# browser derives one from the name and sends it *explicitly*. This function is
+# the whole of that derivation, so the address a name gets is a function of the
+# name and nothing else — no clock, no counter, no randomness. That determinism
+# is a money property, not a nicety: the account id is the ledger's
+# exactly-once guard (§C2.1; ``api/validation.py`` requires one and the server
+# never mints), so a retry of the same submission — including a retry after an
+# outcome the browser never saw — derives the *same* id and earns the API's 409
+# instead of opening a SECOND account carrying a SECOND opening grant. An id
+# minted per attempt would satisfy the form and defeat the guard.
+_SLUG_MAX = 40
+
+
+def _derive_account_id(owner_id: str) -> str:
+    """``acct-`` + an ASCII slug of the name. Readable, stable, retry-safe.
+
+    ASCII-only deliberately: this id is quoted into a URL, into the create
+    response and into the ``pocketful_accounts`` cookie, while the account name —
+    free-form and possibly not Latin — is carried separately by ``owner_id``. A
+    name with no ASCII alphanumerics at all falls back to a digest of the *name*,
+    which is still a pure function of it, and so still retry-stable.
+    """
+    slug: list[str] = []
+    pending_dash = False
+    for ch in owner_id.lower():
+        if ("a" <= ch <= "z") or ("0" <= ch <= "9"):
+            if pending_dash and slug:
+                slug.append("-")
+            pending_dash = False
+            slug.append(ch)
+        else:
+            pending_dash = True
+    text = "".join(slug)[:_SLUG_MAX].strip("-")
+    if not text:
+        text = "u" + hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:12]
+    return "acct-" + text
+
+
+# The cookie that lists the ids this browser has seen (plan §C3.3): ids only,
+# never a name and never a balance. It is read to build the switch list and for
+# nothing else — it never answers "which account is this request about?".
+_COOKIE_NAME = "pocketful_accounts"
+_COOKIE_MAX = 12
+# 30 days. The plan pins the shape (Path, HttpOnly, SameSite, the cap of 12), not
+# the lifetime. A session cookie would forget the switch list on every browser
+# restart while the pending store — the keys, the one thing that must not be
+# lost — lives on disk; that asymmetry is the wrong way round.
+_COOKIE_MAX_AGE = 30 * 24 * 60 * 60
+
+
+def _remembered_account_ids(cookie_header: str | None) -> list[str]:
+    """The ids from the one cookie, or ``[]``. Never anything but ids.
+
+    An unreadable cookie is an empty list rather than an error: the cookie is a
+    convenience, so a value this build cannot parse costs a switch list and
+    nothing else. A name or a balance cannot get in even if a hand-written cookie
+    tries — only ``str`` entries survive, and each is used as an account id.
+    """
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name != _COOKIE_NAME:
+            continue
+        try:
+            decoded = json.loads(unquote(value))
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(decoded, list):
+            return []
+        return [item for item in decoded
+                if isinstance(item, str) and item.strip()][:_COOKIE_MAX]
+    return []
+
+
+def _account_cookie(account_ids: list[str]) -> str:
+    """The ``Set-Cookie`` value for the ids being remembered.
+
+    The payload is the JSON list §C3.3 specifies, percent-encoded so the header
+    is a legal ``cookie-value`` (RFC 6265 excludes ``"`` ``,`` and ``;`` from the
+    raw form) and so an id containing a comma cannot split the list in two.
+    """
+    payload = json.dumps(account_ids[:_COOKIE_MAX], separators=(",", ":"))
+    return (f"{_COOKIE_NAME}={quote(payload, safe='')}; Path=/; HttpOnly; "
+            f"SameSite=Lax; Max-Age={_COOKIE_MAX_AGE}")
 
 
 def _resolve_account(values: dict[str, list[str]], default: str) -> str:
@@ -260,8 +386,10 @@ class WalletUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
         self.close_connection = True
 
-    def _html(self, status: int, markup: str) -> None:
-        self._send_bytes(status, "text/html; charset=utf-8", markup.encode("utf-8"))
+    def _html(self, status: int, markup: str,
+              extra: dict[str, str] | None = None) -> None:
+        self._send_bytes(status, "text/html; charset=utf-8", markup.encode("utf-8"),
+                         extra)
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -274,7 +402,10 @@ class WalletUIHandler(BaseHTTPRequestHandler):
 
     def _render(self, *, account_id: str | None = None,
                 message: str | None = None,
-                notice: str | None = None, status: int = 200) -> None:
+                notice: str | None = None, status: int = 200,
+                create_error: str | None = None,
+                create_name: str | None = None,
+                create_address: str | None = None) -> None:
         base: Wallet = self.server.wallet
         # ``account_id=None`` means the boot account, the same fallback
         # ``_resolve_account`` applies to an absent field.
@@ -301,6 +432,7 @@ class WalletUIHandler(BaseHTTPRequestHandler):
         except WalletProtocolError as exc:
             self._html(502, render_error(f"Unexpected API answer: {exc}", 502))
             return
+        accounts, cookie = self._remember_accounts(wallet)
         self._html(status, render_wallet(
             account_id=wallet.account_id,
             balance_minor=balance,
@@ -313,7 +445,70 @@ class WalletUIHandler(BaseHTTPRequestHandler):
             # (§C2.5), so the heading and the figure cannot come from different
             # moments or different accounts.
             name=wallet.owner_id,
-        ))
+            accounts=accounts,
+            create_error=create_error,
+            create_name=create_name,
+            create_address=create_address,
+        ), {"Set-Cookie": cookie})
+
+    def _probe_account(self, account_id: str) -> dict:
+        """What the server says about one remembered id: its name, or not-found.
+
+        A non-404 failure is *not* proof that the account is gone, so the entry
+        stays a link with no invented name and no invented balance — absence of
+        proof is not proof of absence. Only the API's own 404 marks an id
+        unavailable (§C3.4), and that is the verdict the caller acts on.
+        """
+        base: Wallet = self.server.wallet
+        probe = Wallet(base.client, base.store, account_id)
+        try:
+            with self.server.lock:
+                probe.balance_minor()
+        except ApiError as exc:
+            if exc.status == 404:
+                return {"account_id": account_id, "name": "", "available": False}
+            # Anything else (a 5xx, a transport failure) falls through: the id is
+            # kept and rendered exactly as a remembered id with no name.
+        except (WalletProtocolError, OSError):
+            pass
+        except http.client.HTTPException:
+            # An id this transport cannot even phrase a request for (a control
+            # character surviving a hand-written cookie, before any encoding
+            # rule could help) is not evidence the account is gone. Keep the
+            # entry, invent no name, and answer the page: §C3.4 says the page
+            # never crashes, and "cannot ask" is not "not there".
+            pass
+        return {"account_id": account_id, "name": probe.owner_id or "",
+                "available": True}
+
+    def _remember_accounts(self, active: Wallet) -> tuple[list[dict], str]:
+        """The switch list (plan §C3.3/§C3.4) and the cookie that records it.
+
+        The list starts with the account being rendered — already read for this
+        page, so its name and its balance came from one response — then the ids
+        the browser sent, each verified against the server. Every name in the
+        list is therefore the server's, an id the server 404s is marked
+        unavailable rather than given a balance, and that same id is left out of
+        the cookie: "dropped on the next write", in the one render that still
+        shows it.
+        """
+        remembered = _remembered_account_ids(self.headers.get("Cookie"))
+        candidates = [active.account_id] + [item for item in remembered
+                                            if item != active.account_id]
+        entries: list[dict] = []
+        kept: list[str] = []
+        for account_id in candidates:
+            if any(entry["account_id"] == account_id for entry in entries):
+                continue
+            if account_id == active.account_id:
+                entry = {"account_id": account_id, "name": active.owner_id or "",
+                         "available": True}
+            else:
+                entry = self._probe_account(account_id)
+            entries.append(entry)
+            if entry["available"]:
+                kept.append(account_id)
+        return entries, _account_cookie(kept)
 
     def _form(self) -> dict[str, list[str]]:
         raw_length = self.headers.get("Content-Length")
@@ -332,14 +527,36 @@ class WalletUIHandler(BaseHTTPRequestHandler):
     # -- routes ---------------------------------------------------------------
 
     def do_GET(self) -> None:
-        parts = urlsplit(self.path)
-        if parts.path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if parts.path == "/":
-            self._render_feed(parse_qs(parts.query, keep_blank_values=True))
-            return
-        self._json(404, {"error": "not_found"})
+        """One exit guard for the whole GET surface — see the ``finally``.
+
+        Same shape as ``do_POST``'s, for the same reason: the list of exception
+        types a render can raise is only ever the list someone already imagined,
+        and a GET answered by nothing (the socket closes with no status line) is
+        worse than a wrong page — a browser reloading a create page it never got
+        an answer for is a user retyping into a fresh form. A page id is not a
+        path segment, so an id from the query string or from a hand-written
+        cookie reaches the transport; whatever it does there, this GET answers.
+        """
+        self._responded = False
+        try:
+            parts = urlsplit(self.path)
+            if parts.path == "/health":
+                self._json(200, {"status": "ok"})
+                return
+            if parts.path == "/":
+                self._render_feed(parse_qs(parts.query, keep_blank_values=True))
+                return
+            self._json(404, {"error": "not_found"})
+        except Exception:
+            LOG.exception("unhandled error answering GET %s", self.path)
+        finally:
+            if not self._responded:
+                try:
+                    self._html(500, render_error(
+                        "The page could not be built. Nothing was sent and "
+                        "nothing moved.", 500))
+                except Exception:
+                    LOG.exception("could not send the fallback 500; connection closed")
 
     def do_POST(self) -> None:
         """One exit guard for the whole POST surface — see the ``finally``."""
@@ -385,9 +602,28 @@ class WalletUIHandler(BaseHTTPRequestHandler):
 
         message: str | None = None
         notice: str | None = None
+        create_error: str | None = None
         error = first("error")
         if error:
-            message = _ERROR_MESSAGES.get(error, f"The transfer failed ({error}).")
+            if error in _CREATE_ERROR_CODES:
+                # A refusal of the create form is rendered *in the create card*,
+                # beside the fields it is about and with the typing still in
+                # them, rather than as a page banner over a form that is empty
+                # again. The control is named by the same code that produced it.
+                create_error = _ERROR_MESSAGES.get(
+                    error, "That account could not be created.")
+                if error == "name_taken":
+                    # The refusal that names its subject, from the parameter the
+                    # redirect carries (``_handle_create``). The static sentence
+                    # above is the fallback, not dead code: ``/?error=name_taken``
+                    # is a URL a person can type and it has no address in it, and
+                    # formatting a template with a missing key would raise at the
+                    # lookup rather than answer (§C3.4 — the page always answers).
+                    taken_id = first("taken_id")
+                    if taken_id:
+                        create_error = _NAME_TAKEN_TEMPLATE.format(address=taken_id)
+            else:
+                message = _ERROR_MESSAGES.get(error, f"The transfer failed ({error}).")
         if first("pending"):
             notice = _PENDING_NOTICE
         sent = first("sent")
@@ -398,7 +634,14 @@ class WalletUIHandler(BaseHTTPRequestHandler):
             notice = ("No unconfirmed transfers remained." if retried == "none"
                       else f"Retry {retried}.")
         self._render(account_id=_resolve_account(query, self.server.wallet.account_id),
-                     message=message, notice=notice)
+                     message=message, notice=notice,
+                     create_error=create_error,
+                     # Echoed straight back so a refusal costs no typing: the
+                     # form is rebuilt from the query with the name and the
+                     # address that were submitted (plan §C3.2, "the form still
+                     # filled in").
+                     create_name=first("new_name"),
+                     create_address=first("new_id"))
 
     def _handle_send(self) -> None:
         form = self._form()
@@ -443,14 +686,30 @@ class WalletUIHandler(BaseHTTPRequestHandler):
         It mints no idempotency key and touches no store: creating an account
         moves no money, so there is nothing to be idempotent about. Every
         branch answers 303 into a GET like every other POST.
+
+        **The blank address is filled in here, deterministically.** plan §C3.2:
+        creation asks for a name, and if the address is blank the browser derives
+        one from the name and sends it explicitly — the server still never mints
+        (§C2.1). ``_derive_account_id`` is a function of the submitted name alone,
+        which is what keeps the exactly-once guard intact on this path: the same
+        submission always asks for the same id, so a retry after an outcome the
+        browser never saw earns the API's 409 rather than a second account with a
+        second opening grant.
+
+        A refusal is reported by the *code*, and answered into a GET that still
+        carries the name and the address the user typed, so the card can be
+        re-rendered with them rather than blank.
         """
         form = self._form()
         owner_id = ((form.get("owner_id") or [""])[0]).strip()
         currency = ((form.get("currency") or [""])[0]).strip() or "USD"
-        account_id = ((form.get("account_id") or [""])[0]).strip() or None
+        typed = ((form.get("account_id") or [""])[0]).strip()
+        echo = (f"&new_name={quote(owner_id, safe='')}"
+                f"&new_id={quote(typed, safe='')}")
         if not owner_id:
-            self._redirect("/?error=missing_owner")
+            self._redirect("/?error=missing_owner" + echo)
             return
+        account_id = typed or _derive_account_id(owner_id)
         client = self.server.wallet.client
         try:
             with self.server.lock:
@@ -461,12 +720,22 @@ class WalletUIHandler(BaseHTTPRequestHandler):
             code = exc.code or "api"
             if code in ("invalid_request", "validation_failed"):
                 code = "invalid_account"
-            self._redirect(f"/?error={quote(code, safe='')}")
+            elif code == "account_exists" and not typed:
+                # The id was derived from the name, so what is taken is the
+                # **address** the name derives (§C3.2) — not the name, which is
+                # free. The address is carried to the render side in its own
+                # parameter rather than in ``new_id``: that field prefills the
+                # address input, so filling it would turn a blank-address
+                # resubmit into an explicit-id one and stop exercising this very
+                # branch (and its ``account_exists`` sibling would answer next).
+                code = "name_taken"
+                echo += f"&taken_id={quote(account_id, safe='')}"
+            self._redirect(f"/?error={quote(code, safe='')}" + echo)
             return
         new_id = account.get("account_id") if isinstance(account, dict) else None
         if not isinstance(new_id, str) or not new_id:
             # The API created something we cannot name; do not pretend to show it.
-            self._redirect("/?error=api")
+            self._redirect("/?error=api" + echo)
             return
         self._redirect(f"/?account={quote(new_id, safe='')}")
 

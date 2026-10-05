@@ -38,6 +38,7 @@ disagree, that is a finding for the reviewer, not a silent win for either.
 from __future__ import annotations
 
 import html
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 from .money import format_minor
@@ -55,6 +56,17 @@ from .money import format_minor
 # One value is load-bearing and must not be "tidied": dark ``--border-strong`` is
 # #64748b because the first candidate measured 2.95:1 against ``--surface``,
 # under the 3:1 WCAG 1.4.11 requires of a control boundary.
+#
+# ``--border`` is a *decorative hairline* — a region rule, a table row divider —
+# and it is tuned to be barely there (light 1.28:1, dark 1.43:1 against
+# ``--surface``). ``--border-edge`` is the different job that kept being handed
+# to it: **the boundary of a panel whose border is its only separation signal.**
+# It equals ``--border`` in light, where a card is carried by its fill step and
+# its shadow, and ``--border-strong`` in dark, where both of those collapse
+# (fill 1.10:1, and ``--shadow-1`` composites to 1.04:1 — a black shadow on a
+# near-black page, i.e. nothing). Where the element is a *control* rather than a
+# panel the border is its only affordance in **either** palette, so controls take
+# ``--border-strong`` outright. Added 2026-10-05; see DESIGN-SPEC.md §5.9.
 
 TOKENS: dict[str, str] = {
     # type
@@ -89,6 +101,7 @@ TOKENS: dict[str, str] = {
     "--surface-2": "#eef2f7",
     "--border": "#dfe4ec",
     "--border-strong": "#6b7280",
+    "--border-edge": "#dfe4ec",
     # text
     "--text": "#111827",
     "--text-2": "#4b5563",
@@ -118,6 +131,7 @@ TOKENS_DARK: dict[str, str] = {
     "--surface-2": "#18202c",
     "--border": "#2a3646",
     "--border-strong": "#64748b",
+    "--border-edge": "#64748b",
     "--text": "#e8edf5",
     "--text-2": "#b6c2d4",
     "--muted": "#9aa7b8",
@@ -176,6 +190,11 @@ a { color: var(--accent); }
       clip-path: inset(50%); white-space: nowrap; }
 
 /* shell — the classes app/web.py composes the page from (DESIGN-SPEC.md §4) */
+/* .topbar's rule is a *region* hairline, not a component boundary: it separates
+   the header strip from the page, and the header's own content (the brand, the
+   demo notice) is what identifies it. 1.4.11 does not bind it, and a
+   --border-strong line across the full page top would read as a heavy bar in
+   light. Deliberately left on the decorative token; see DESIGN-SPEC.md §5.9. */
 .topbar { border-bottom: 1px solid var(--border); background: var(--surface); }
 .topbar__inner { max-width: 64rem; margin: 0 auto; padding: var(--s3) var(--s4);
                  display: flex; gap: var(--s4); align-items: center;
@@ -198,7 +217,13 @@ a { color: var(--accent); }
 }
 
 /* cards */
-.card { background: var(--surface); border: 1px solid var(--border);
+/* --border-edge, not --border: in dark the border is this element's ONLY
+   boundary signal (fill 1.10:1, shadow 1.04:1 — both nil). In light it resolves
+   to the same hairline as before, because there the fill step *and* the shadow
+   carry the card. Swapping only the token is the whole change, and the light
+   rendering of *this rule* is byte-identical. (.switcher below is the other half
+   of the sweep and does change in light — deliberately, and it says so there.) */
+.card { background: var(--surface); border: 1px solid var(--border-edge);
         border-radius: var(--radius-card); padding: var(--s4);
         box-shadow: var(--shadow-1); display: grid; gap: var(--s3); }
 .h1 { font-size: var(--t-h1); font-weight: 600; }
@@ -232,7 +257,10 @@ input { min-height: 44px; padding: var(--s2); font: inherit; color: var(--text);
 .form { display: grid; gap: var(--s3); }
 .form-row { display: flex; gap: var(--s3); flex-wrap: wrap; align-items: end; }
 .form-row .field { flex: 1 1 12rem; }
-.adv { border-top: 1px solid var(--border); padding-top: var(--s3); }
+/* The rule above the "Advanced" disclosure separates two regions of the *same*
+   card — `--surface` on both sides, so the fill tells the reader nothing and the
+   rule is the only separation there is. Same token as .card, same reason. */
+.adv { border-top: 1px solid var(--border-edge); padding-top: var(--s3); }
 .adv summary { cursor: pointer; color: var(--text-2); font-size: var(--t-small);
                min-height: 44px; display: flex; align-items: center; }
 .adv[open] summary { margin-bottom: var(--s3); }
@@ -274,17 +302,30 @@ input { min-height: 44px; padding: var(--s2); font: inherit; color: var(--text);
                      word-break: break-all; }
 
 /* switcher */
+/* Each entry is a LINK. Its border is the entire affordance — the fill is
+   transparent, so it is the card's own --surface behind it (1.00:1) and there is
+   no shadow. 1.4.11 therefore binds it in **both** palettes, and the decorative
+   hairline was not enough in either (light 1.28:1, dark 1.43:1 against
+   --surface). --border-strong is not a new preference here: it is the token
+   .btn and input already use for exactly this, so the chips now match the
+   buttons beside them. This tightens light as well as dark — stated in
+   DESIGN-SPEC.md §5.9 rather than slipped in. */
 .switcher { list-style: none; padding: 0; display: flex; gap: var(--s2);
             flex-wrap: wrap; }
 .switcher a, .switcher span { display: inline-flex; align-items: center;
             min-height: 44px; padding: var(--s1) var(--s3);
-            border-radius: var(--radius-pill); border: 1px solid var(--border);
+            border-radius: var(--radius-pill); border: 1px solid var(--border-strong);
             font-size: var(--t-small); text-decoration: none; color: var(--text-2); }
 .switcher [aria-current="page"] { border-color: var(--accent);
             background: var(--accent-dim); color: var(--accent); font-weight: 600; }
 .switcher .unavailable { color: var(--muted); border-style: dashed; }
 
 /* activity */
+/* Row dividers, deliberately on the decorative token. A table row is not a user
+   interface component and the rule is not required to understand the content —
+   the cell text and the column alignment carry that. At --border-strong the
+   dividers would be 3.67:1 horizontal bars across every row, which is a heavier
+   table than the content wants. Ruled out in DESIGN-SPEC.md §5.9, not missed. */
 .activity { width: 100%; border-collapse: collapse; }
 .activity th, .activity td { text-align: left; padding: var(--s2) var(--s3);
             border-bottom: 1px solid var(--border); vertical-align: baseline; }
@@ -296,6 +337,10 @@ input { min-height: 44px; padding: var(--s2); font: inherit; color: var(--text);
             color: var(--text-2); word-break: break-all; }
 .activity .dir { white-space: nowrap; }
 .activity .credit { color: var(--ok-text); }
+/* The When column, now that it holds a humanised value (DESIGN-SPEC.md §5.6):
+   keep it on one line, and secondary to the amount it dates. The exact recorded
+   string is in the cell's title, not here. */
+.activity .when { white-space: nowrap; color: var(--text-2); }
 
 /* empty state */
 .empty { display: grid; gap: var(--s1); padding: var(--s5) var(--s4);
@@ -346,6 +391,44 @@ def _field(row: object, name: str, default: object = None) -> object:
     if isinstance(row, dict):
         return row[name] if name in row else default
     return getattr(row, name, default)
+
+
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _when_display(value: object) -> str:
+    """A timestamp a person can read, or the value verbatim.
+
+    The ledger stores ISO-8601. ``2026-10-04T08:33:07.221767+00:00`` in a table
+    cell is microseconds of precision nobody reading an activity feed asked for,
+    and it takes a third of the row's width to say it. The raw string stays in
+    the cell's ``title``, so the exact recorded value is still reachable and
+    still copyable — the display is narrowed, not the record.
+
+    **Always UTC, and it says so.** The stored value carries an offset; rendering
+    a *local* time would make the page depend on the reading machine's clock
+    settings, which would in turn make every row that measures this page depend
+    on the machine it runs on. Naming the zone costs five characters and removes
+    both problems.
+
+    Anything this cannot parse is returned **unchanged**, and a naive timestamp
+    (no offset) is one of those: its zone is genuinely unknown, so restating it
+    under a "UTC" label would be the module inventing a fact about the record.
+    """
+    text = _text(value)
+    if not text:
+        return ""
+    candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return text
+    parsed = parsed.astimezone(timezone.utc)
+    return (f"{parsed.day} {_MONTHS[parsed.month - 1]} {parsed.year}, "
+            f"{parsed.hour:02d}:{parsed.minute:02d} UTC")
 
 
 def _amount_display(row: object) -> str:
@@ -588,7 +671,7 @@ def activity_table(*, rows: object) -> str:
         amount_class = "amt" if debit else "amt credit"
         body.append(
             "<tr>"
-            f'<td class="when" title="{_esc(when)}">{_esc(when)}</td>'
+            f'<td class="when" title="{_esc(when)}">{_esc(_when_display(when))}</td>'
             f'<td class="dir">{_esc(word)}</td>'
             f'<td class="who" title="{_esc(account_id)}">{_esc(shown)}</td>'
             f'<td class="{amount_class}">{_esc(sign + amount)}</td>'
@@ -645,7 +728,7 @@ def pending_block(*, pending: object, action: str = "/retry") -> str:
             "<li>"
             f'<span class="amt">{_esc(_amount_display(rec))}</span>'
             f'<span class="who">{_esc(sender)} → {_esc(payee)}</span>'
-            f'<span class="when">{_esc(when)}</span>'
+            f'<span class="when" title="{_esc(when)}">{_esc(_when_display(when))}</span>'
             "</li>"
         )
     return (

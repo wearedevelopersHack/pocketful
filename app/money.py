@@ -87,7 +87,16 @@ def format_minor(amount_minor: int, currency: str = "USD") -> str:
     if type(amount_minor) is not int:
         raise TypeError(
             f"amount_minor must be an int (minor units), got {type(amount_minor).__name__}")
-    sign = "-" if amount_minor < 0 else ""
+    # U+2212 MINUS SIGN, not the ASCII hyphen. One minus in the product: the
+    # activity table signs a debit with U+2212 (app/design.py), and this is the
+    # balance formatter, so an ASCII hyphen here put two different minus
+    # characters in the same document — visible on the one page whose balance can
+    # be negative (the system account's, whose activity rows are all `−`-signed).
+    # Recorded counter-argument, not dismissed: an ASCII hyphen is announced as
+    # "minus" by more screen readers than U+2212 is. Consistency across one page
+    # wins here; if that trade is ever revisited, this line and the activity
+    # table change together, and DESIGN-SPEC §5.6's table changes with them.
+    sign = "−" if amount_minor < 0 else ""
     whole, frac = divmod(abs(amount_minor), 100)
     symbol = _SYMBOLS.get(currency)
     if symbol is not None:

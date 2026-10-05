@@ -17,6 +17,7 @@ import json
 import urllib.error
 import urllib.request
 from typing import Callable, Optional
+from urllib.parse import quote
 
 # (method, url, body_bytes, headers) -> (status, body_bytes)
 Transport = Callable[[str, str, Optional[bytes], dict], tuple]
@@ -114,11 +115,20 @@ class ApiClient:
                              {"Content-Type": "application/json"})
 
     def get_balance(self, account_id: str) -> dict:
-        return self._request("GET", f"/accounts/{account_id}/balance")
+        # The id is opaque to this transport. A typed address is whatever the
+        # user typed (§C3.2), and a URL path segment is not that: interpolating
+        # it raw raises ``http.client.InvalidURL`` inside urllib for a space or
+        # a control character, and lets a ``%`` be decoded by the server into a
+        # *different* id. Quoting here is what makes every id the API accepted
+        # addressable by the id it accepted — the server decodes the segment
+        # back to the same string.
+        return self._request("GET", f"/accounts/{quote(account_id, safe='')}/balance")
 
     def list_activity(self, account_id: str, *, limit: int = 50,
                       before: str | None = None) -> dict:
-        path = f"/accounts/{account_id}/activity?limit={int(limit)}"
+        # Quoted for the same reason as ``get_balance``: one rule, applied
+        # wherever an id becomes a path.
+        path = f"/accounts/{quote(account_id, safe='')}/activity?limit={int(limit)}"
         if before is not None:
             path += f"&before={before}"
         return self._request("GET", path)

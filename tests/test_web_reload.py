@@ -637,5 +637,192 @@ class ReloadOfTheSendResponse(unittest.TestCase):
                                  "stands, with no key left to replay it")
 
 
+class UnforeseenReadFailure(Exception):
+    """A failure type that appears on NO ``except`` list in ``app/web.py``.
+
+    The GET twin of :class:`UnforeseenFailure`, and it exists for the same
+    reason: ``_render_feed`` catches the ``ApiError`` family it knows about, and
+    this type is named nowhere. ``ApiClient`` wraps only ``OSError``, so it
+    escapes every clause the render has. Nothing in ``_render_feed`` can answer
+    it — the only thing that can answer the request is ``do_GET``'s own exit
+    guard. An enumerative fix cannot reach it; only a structural one can.
+    """
+
+
+class UnforeseenReadResponse:
+    """Real HTTP, then an unforeseen exception instead of the answer.
+
+    The read reaches the API and is answered — the server has done its part
+    correctly — and the failure is raised on the way back, inside the render
+    that was going to use it. The page therefore genuinely cannot be built. The
+    question this transport exists to ask is what the *handler* does about that.
+    """
+
+    def __init__(self, path_fragment="/accounts/"):
+        self.path_fragment = path_fragment
+        self.spring_count = 0
+
+    def __call__(self, method, url, body, headers):
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                status, raw = exc.code, exc.read()
+            finally:
+                exc.close()  # unclosed HTTPError -> ResourceWarning at GC
+        if method == "GET" and self.path_fragment in url:
+            self.spring_count += 1
+            raise UnforeseenReadFailure("a type no `except` clause names")
+        return status, raw
+
+
+class NoGetExitGuardHandler(app_web.WalletUIHandler):
+    """MUTANT: ``do_GET`` as it was before the exit guard — dispatch and return.
+
+    The live ``do_GET`` (``app/web.py:516``) with the ``try/except/finally``
+    guard removed and nothing else changed: no catch-all, no ``_responded``
+    bookkeeping. ``_render_feed`` is left live, so the mutant does not get to
+    rely on a clause it did not write.
+
+    Reconstructed from deleted bytes (no version control), so its fidelity is a
+    judgment call and not the author's to certify — the same caveat
+    ``PreFixSendHandler`` and ``NoExitGuardHandler`` carry.
+    """
+
+    def do_GET(self) -> None:
+        parts = urlsplit(self.path)
+        if parts.path == "/health":
+            self._json(200, {"status": "ok"})
+            return
+        if parts.path == "/":
+            self._render_feed(app_web.parse_qs(parts.query, keep_blank_values=True))
+            return
+        self._json(404, {"error": "not_found"})
+
+
+class TheGetExitGuard(unittest.TestCase):
+    """The GET half of the exit guarantee, which had no row anywhere.
+
+    ``app/web.py:516`` is the only ``do_GET`` in the tree. Every fault row in
+    this file overrides ``do_POST``, and the ``[WEB]`` fault labels in
+    ``app/selfcheck.py`` are the POST path too — so the GET guard (a ``try`` that
+    catches ``Exception``, and a ``finally`` that sends the fallback when nothing
+    was written) was exercised by no row at all, in-gate or out, while
+    demonstrably working. A guarantee no row can fail is a guarantee that
+    survives being deleted.
+
+    The defect it guards against is the one this whole file is about, one
+    method over: a request answered by *nothing* — the socket closed with no
+    status line — which a browser sees as a dead page rather than a wrong one,
+    and which no status-code assertion can distinguish from a client that never
+    asked.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store_path = os.path.join(self._tmp.name, "ui-pending.json")
+
+    def _fund(self, base):
+        client = ApiClient(base)
+        client.create_account(owner_id=MINT, currency="USD",
+                              allow_overdraft=True, account_id=MINT)
+        client.create_account(owner_id=PAYER, currency="USD", account_id=PAYER)
+
+    @contextlib.contextmanager
+    def _ui(self, base, transport, handler=app_web.WalletUIHandler):
+        """A real `app.web` server, optionally with the pre-fix GET handler."""
+        store = PendingStore(self.store_path)
+        wallet = Wallet(ApiClient(base, transport=transport), store, PAYER)
+        server = app_web.WalletUIServer(("127.0.0.1", 0), handler, wallet=wallet)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever,
+                                  kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            time.sleep(0.05)
+            yield port
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def _read(self, port, path="/"):
+        """One GET, with "no answer at all" turned into a legible failure.
+
+        ``_request`` returns any HTTP status, including 500 — so a caller that
+        only checks the status cannot tell "the guard answered badly" from "the
+        guard did not answer". This turns the second into a failure that names
+        what was observed, the same shape as ``_press_unforeseen_then_reload``.
+        """
+        try:
+            return _request(port, "GET", path)
+        except (OSError, http.client.HTTPException) as exc:
+            raise AssertionError(
+                f"T43 no status line: the reply to GET {path} never arrived "
+                f"({type(exc).__name__}: {exc})") from exc
+
+    def test_the_get_guard_answers_a_fault_no_clause_could_have_named(self):
+        """The live ``do_GET``: an unforeseen render failure is still answered.
+
+        The premise is measured before the effect. Without it, a 500 could be a
+        response to the wrong thing entirely — a route that never rendered, a
+        server that refused the request — and the row would be crediting the
+        guard for a fault it never saw.
+        """
+        with _running_api() as (_, base, _):
+            self._fund(base)
+            transport = UnforeseenReadResponse()
+            with self._ui(base, transport) as port:
+                before = transport.spring_count
+                status, _, body = self._read(port, "/")
+                # Measured inside the block: the transport is the mutant's, and a
+                # later assertion outside it could not attribute the count.
+                self.assertGreater(
+                    transport.spring_count, before,
+                    "premise: the injected read failure must actually have fired, "
+                    "or the answer below is a response to something else")
+
+        self.assertEqual(
+            status, 500,
+            "a render failure the handler has no clause for must still be answered "
+            f"with a status line; got {status}")
+        self.assertIn(
+            "The page could not be built. Nothing was sent and nothing moved.", body,
+            "the fallback must be do_GET's own — a body that is not the fallback "
+            "would mean the request was answered by something other than the guard")
+
+    def test_without_the_get_guard_the_same_fault_answers_nothing(self):
+        """Teeth: the guard is the only thing answering this request.
+
+        With the guard removed the GET gets no status line at all — not a 500,
+        not a page, *nothing*. That is the pre-fix defect exactly, and it is why
+        the assertion above has to distinguish "answered badly" from "not
+        answered": both are green under a status-only check on a wildcard.
+
+        The mutant's premise is asserted too, and it is a different premise from
+        the control's: it must have faulted for the **same reason**, or "no
+        answer" could be attributable to something the mutant broke elsewhere.
+        """
+        with _running_api() as (_, base, _):
+            self._fund(base)
+            transport = UnforeseenReadResponse()
+            with self._ui(base, transport, handler=NoGetExitGuardHandler) as port:
+                with self.assertRaises(AssertionError) as caught:
+                    self._read(port, "/")
+                self.assertGreater(
+                    transport.spring_count, 0,
+                    "premise: the mutant must have faulted on the read exactly as "
+                    "the control did, or its silence is not attributable to the "
+                    "missing guard")
+
+        self.assertIn(
+            "T43 no status line", str(caught.exception),
+            "the failure must name what was observed — no reply committed — not "
+            "merely raise somewhere incidental")
+
+
 if __name__ == "__main__":
     unittest.main()

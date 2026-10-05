@@ -65,12 +65,14 @@ cross-file serialization requirement.
 
 import contextlib
 import http.client
+import inspect
 import json
 import os
 import re
 import shutil
 import sqlite3
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -80,8 +82,10 @@ import urllib.request
 from unittest import mock
 from urllib.parse import urlsplit
 
+import app.client as app_client
 from app.client import ApiClient
 from app.keystore import PendingStore
+from app.money import format_minor
 from app.wallet import Wallet
 import app.web as app_web
 
@@ -128,6 +132,184 @@ _BALANCE = re.compile(r'<p class="balance">(?:<span[^>]*></span>)?\s*([^<]*)</p>
 empty ``<span class="cur">`` before the figure (the class hook the stylesheet
 targets, emitted with ``aria-hidden``), so the reader skips the span rather than
 the whole element being renamed away."""
+
+# A create refusal is rendered **inside the create card** (``app/design.py``'s
+# ``create_form``), beside the fields it is about — not as a page banner. Two
+# scopes are therefore needed to read it, and both are load-bearing:
+#
+#   * ``banner--error`` alone is not discriminating. ``design.banner`` emits the
+#     same class for page-level refusals, so a document-wide search for the class
+#     can return a *send* refusal's banner just as easily.
+#   * a document-wide search for the **address** is green on the broken tree for
+#     a third, quieter reason: ``wallet_header`` renders
+#     ``<code class="addr" title="…">`` and the title attribute carries the
+#     active account's id. ``assertIn(derived, page)`` is satisfied by that
+#     attribute, by an activity row's counterparty, or by the payee of a pending
+#     transfer — none of which is "the refusal named the address".
+#
+# So read the section, then the banner inside it, then the text node. A create
+# card has exactly one ``<section>``, so the non-greedy close is unambiguous.
+_CREATE_CARD = re.compile(r'<section\b[^>]*\bid="create"[^>]*>(.*?)</section>',
+                          re.I | re.S)
+_CARD_ERROR_TEXT = re.compile(
+    r'<p\b[^>]*class="banner banner--error"[^>]*>.*?<span>([^<]*)</span>',
+    re.I | re.S)
+
+
+def _create_card_error(page):
+    """The create card's error-banner text, or ``None`` when it carries none."""
+    card = _CREATE_CARD.search(page)
+    if card is None:
+        return None
+    found = _CARD_ERROR_TEXT.search(card.group(1))
+    return found.group(1) if found else None
+
+
+def _refusal_problems(page, derived):
+    """Why the create card's refusal fails to name ``derived``; ``[]`` if it does.
+
+    One predicate, used by the row and by its falsifier, so the falsifier cannot
+    be a second, weaker paraphrase of the row: it is the row's own condition.
+    """
+    message = _create_card_error(page)
+    if message is None:
+        return ["the create card carries no error banner, so the refusal is not "
+                "rendered in the control it is about"]
+    if derived not in message:
+        return [f"the refusal does not name the address it collided with "
+                f"({derived!r}); the banner says {message!r}"]
+    return []
+
+
+_REAL_NAME_TAKEN_TEMPLATE = app_web._NAME_TAKEN_TEMPLATE
+"""The landed template, captured before the falsifier replaces it.
+
+The falsifier cannot read ``app_web._NAME_TAKEN_TEMPLATE`` while its patch is
+held — that name *is* the mutant — so the genuine object is captured at import,
+the same technique ``_REAL_DOCUMENT`` uses below.
+"""
+
+_PRE_FIX_NAME_TAKEN_COPY = ("That name is already taken. Nothing was created — "
+                            "pick another.")
+"""The refusal's copy as it read **before** the address was carried to the render
+site: the static ``_ERROR_MESSAGES["name_taken"]`` sentence, with no address and
+no placeholder to format one in.
+
+This is the mutant's shape, not a paraphrase of it. The pre-fix render site had
+no ``taken_id`` lookup at all and answered this string unconditionally; patching
+the template to this placeholder-free sentence reproduces exactly that rendering
+while leaving every other line of the landed code in place — so the red below is
+attributable to the missing address and not to a broken page.
+"""
+
+
+# -- the id is opaque: it has to survive the trip into a URL path --------------
+#
+# ``app/client.py`` builds ``/accounts/{id}/balance`` and ``/accounts/{id}/activity``
+# by interpolation, and an account id is not a URL path segment. Three shapes
+# come out of getting that wrong, and only one of them is "no answer":
+#
+#   * a space or a control character -> ``http.client.InvalidURL`` raised inside
+#     urllib, so the request is never sent and the socket closes unanswered;
+#   * ``/``, ``?`` or ``#`` -> the request *is* sent, but the path is re-cut so
+#     it lands on a different route (a 404, or a different account);
+#   * ``%`` -> the request is sent and the server decodes the segment once more
+#     than the caller meant, so an id that looks like an encoding of another id
+#     **reads that other account, silently, with a 200**.
+#
+# The third is the one worth a row that fails on ``owner_id``: an assertion like
+# "an answer came back" is green on it, and a mutant that produced only
+# ``InvalidURL`` would satisfy "the row went red" while still serving someone
+# else's balance.
+#
+# The fix is ``quote(account_id, safe="")`` at the two call sites, and it stays
+# **client-side**: ``%20`` in a path segment *is* a space (RFC 3986), so decoding
+# it on the server is correct and "hardening" the parser against it would be a
+# regression, not a fix.
+
+_PLAIN_ID = "acct a b"
+_ENCODED_ID = "acct%20a%20b"
+"""Two accounts that are each other's trap: ``_ENCODED_ID`` is not the encoding
+of ``_PLAIN_ID`` as a *string* — it is a distinct 11-character id that only
+becomes ``_PLAIN_ID`` when a URL decoder runs over it one extra time."""
+
+_FUNDER_A, _FUNDER_B = "acct-funder-a", "acct-funder-b"
+_PLAIN_AMOUNT, _ENCODED_AMOUNT = 111, 222
+
+# (id, owner, the funder that paid it, the amount it was paid) — the id is read
+# back through both client methods, and each must answer with its own account.
+# The two lookalikes are funded from **different** accounts so an activity read
+# that retargeted onto one of them is distinguishable from the other's.
+#
+# Every account also has an opening-grant row from ``__system__``, so "the right
+# activity" is not "exactly one row": it is *this account's funding row present
+# and the other lookalike's absent*.
+_LOOKALIKES = ((_PLAIN_ID, "alice", _FUNDER_A, _PLAIN_AMOUNT, _FUNDER_B),
+               (_ENCODED_ID, "mallory", _FUNDER_B, _ENCODED_AMOUNT, _FUNDER_A))
+
+
+def _ownership_problems(answer, account_id, owner):
+    """Why a balance read is not ``account_id``'s own; ``[]`` when it is.
+
+    Keyed on ``account_id`` and ``owner_id`` rather than on the amount. A
+    retarget that happened to land on an account with the same balance would
+    slip past an amount check; it cannot slip past the identity.
+    """
+    problems = []
+    if not isinstance(answer, dict):
+        return [f"the read answered {answer!r}, not a balance object"]
+    if answer.get("account_id") != account_id:
+        problems.append(f"answered for {answer.get('account_id')!r}, "
+                        f"not for {account_id!r}")
+    if answer.get("owner_id") != owner:
+        problems.append(f"answered as owner {answer.get('owner_id')!r}, "
+                        f"not {owner!r}")
+    return problems
+
+
+def _activity_problems(answer, counterparty_owner, amount_minor, other_owner):
+    """Why an activity read is not the expected account's; ``[]`` when it is.
+
+    The counterparty owner is the discriminator: the two lookalikes are funded
+    from different accounts, so a read that retargeted onto one of them carries
+    the *other* one's funding row. Presence and absence are both checked —
+    asserting only that this account's row is present would pass on a read that
+    returned another account's rows alongside it.
+    """
+    items = answer.get("items") if isinstance(answer, dict) else None
+    if not isinstance(items, list) or not items:
+        return [f"the activity read returned no rows: {items!r}"]
+    pairs = [(item.get("counterparty_owner_id"), item.get("amount_minor"))
+             for item in items]
+    problems = []
+    if (counterparty_owner, amount_minor) not in pairs:
+        problems.append(f"this account's own funding row is missing: expected one "
+                        f"from {counterparty_owner!r} for {amount_minor}; got {pairs!r}")
+    if any(owner == other_owner for owner, _ in pairs):
+        problems.append(f"the read carries {other_owner!r}'s funding row, so it "
+                        f"answered for the other account: {pairs!r}")
+    return problems
+
+
+def _unquoted(method_name):
+    """MUTANT: one landed client method, with ``quote`` replaced by the identity.
+
+    Built by ``inspect.getsource`` of the real method rather than retyped, so it
+    cannot drift from the body it is supposed to be mutating — a reconstruction
+    of the pre-fix bytes would have no witness but its author's memory, and it
+    would silently stop being a mutant the moment the landed body changed shape.
+
+    It reverts exactly **one** site: only the named method is exec'd, so its
+    sibling keeps its quoting. That is what keeps the detection attributable —
+    reverting both at once (patching ``app.client.quote``) reds two rows at the
+    same instant and says nothing about which belongs to which.
+    """
+    namespace = dict(vars(app_client))
+    namespace["quote"] = lambda value, safe="": value
+    source = textwrap.dedent(
+        inspect.getsource(getattr(app_client.ApiClient, method_name)))
+    exec(source, namespace)
+    return namespace[method_name]
 
 
 def _import_api():
@@ -354,6 +536,49 @@ def _documents_missing_the_notice(port, paths):
         if app_web.DEMO_NOTICE not in body:
             missing.append(path)
     return missing
+
+
+# -- C3.7: the welcome is a ledger ROW, not a note -----------------------------
+
+_WELCOME = re.compile(r"welcome", re.I)
+"""C3.7's forbidden copy, case-insensitive — the plan's own wording: "the
+create-success document contains no occurrence of ``welcome`` (case-insensitive)"."""
+
+
+def _welcome_occurrences(document):
+    """Every occurrence of the forbidden grant announcement in ``document``.
+
+    Returns short snippets, empty when there are none. A **returned measurement**
+    rather than an assertion, so the row that requires the absence and the
+    falsifier that requires the presence make the *same* measurement — a
+    falsifier that re-spelled the search would be evidence about the falsifier.
+    """
+    return [document[max(0, m.start() - 40):m.end() + 40].replace("\n", " ")
+            for m in _WELCOME.finditer(document)]
+
+
+_REAL_CREATE_FORM = app_web.create_form
+"""Captured before the mutant replaces the module global, for the same reason as
+``_REAL_DOCUMENT``: a mutant that reached the original through the name it just
+replaced would call itself."""
+
+_WELCOME_COPY = "New accounts start with a $100.00 Welcome bonus."
+"""The copy C3.7 rules out, in the shape C3.7(a) names: a note on ``create_form``.
+Injected through the component that actually renders the form, so the mutant
+travels the real create path rather than a reconstruction of it."""
+
+
+def _create_form_with_welcome_copy(*, action, name_value, address_value, error=None):
+    """MUTANT: C3.7's defect (a), reintroduced into the real create form.
+
+    ``app/design.py:138`` records that ``WELCOME_BONUS_LABEL`` was deleted rather
+    than left as dead copy; this puts an announcement back on the form the create
+    page renders, which is the only seam through which a served document could
+    acquire a "welcome" string without the ledger being involved at all.
+    """
+    return _REAL_CREATE_FORM(action=action, name_value=name_value,
+                             address_value=address_value, error=error) + (
+        f'<p class="hint">{_WELCOME_COPY}</p>')
 
 
 # -- the pending item names its sender -----------------------------------------
@@ -615,6 +840,310 @@ class AccountsAndSwitching(unittest.TestCase):
                                  "the balance element must carry the number the "
                                  "server answered with, not the grant the create "
                                  "implies and not a constant")
+
+    def test_the_create_success_document_announces_no_welcome(self):
+        """C3.7 as the negative the plan says is checkable: the create-success
+        document contains no occurrence of "welcome", case-insensitive.
+
+        The rule (plan §C3.7, ratified as ``DESIGN-SPEC`` §5.8 option (c) on
+        2026-10-04) is that the welcome is a ledger **row**, not a note: the user
+        learns the $100 the way they learn every other movement, from the activity
+        row ``Received from Pocketful  +$100.00``, which is true on every render.
+        This row therefore does not assert that the grant is *shown* —
+        ``test_activity_counterparty.py`` owns the grant's own row — it asserts the
+        absence of an announcement *beside* it. Two ways of breaking it were
+        already ruled out and are not re-opened here: a "starts with $100.00" note
+        on ``create_form`` is false for a EUR choice (the grant is USD-only), and
+        keying copy on ``counterparty_account_id == "__system__"`` couples visible
+        text to a reserved ledger internal.
+
+        It is a negative, so it can pass for the wrong reason, and the guards are
+        built in rather than assumed: the landed-on document must be the **new
+        account's real page** — ``_active_account`` reads the address element and
+        the balance element must render the grant — so an error page or a stub
+        body cannot be "no welcome" by vacuity. The falsifier below drives this
+        same predicate against a document that carries the copy, so the row is not
+        a sentence that is always true.
+
+        Scope, stated because the plan's sentence is broader than this row. The
+        plan says "no ``welcome`` copy on any render path"; this row checks the
+        **create-success document** — the document the 303 lands on, which is the
+        named checkable form — and the wallet GETs listed below, because
+        ``create_form`` is rendered on all of them and the ruled-out defect (a) is
+        a note on that component. It does **not** cover the stdlib error pages
+        that never pass through ``_document`` (the blind spot
+        ``test_every_document_the_ui_builds_carries_the_demo_disclosure`` names),
+        nor any HTML that does not come from ``app/design.py``'s components.
+
+        One more boundary, found by writing this row rather than by reading the
+        plan: the plan's checkable form is a **raw substring search over the whole
+        document**, and the create-success document echoes the name the creator
+        typed. The first draft of this row used the fixture name
+        ``t14-welcome-owner`` and went red on correct code — the "occurrence" it
+        found was the user's own account name, in the ``<h1>`` and in the
+        switcher. So the negative is a property of the app's **copy**, and the
+        fixture has to keep the word out of its own data for the measurement to be
+        about the app at all. The name is deliberately neutral (``t14-owner``) and
+        that is stated here rather than left as an accident of the fixture; a
+        creator who names their account "welcome" would still redden the raw
+        search, which is a fact about the check's shape and is raised as such.
+        """
+        with _running_api() as (_, base):
+            self._fund(base)
+            with _ui(self.store_path, base) as port:
+                status, headers, _ = _request(
+                    port, "POST", "/create",
+                    {"owner_id": "t14-owner", "currency": "USD",
+                     "account_id": NEW})
+                self.assertEqual(status, 303,
+                                 f"POST /create must answer 303; got {status}")
+                location = headers.get("Location") or ""
+                follow, _, landed = _request(port, "GET", location)
+                self.assertEqual(follow, 200,
+                                 f"the 303 target must be a GET answering 200; "
+                                 f"{location!r} gave {follow}")
+                self.assertEqual(
+                    _active_account(landed), NEW,
+                    "the create-success document must be the new account's page, or "
+                    "the negative below is asserted over the wrong document")
+                self.assertEqual(
+                    _balance_text(landed), format_minor(OPENING_GRANT_MINOR, "USD"),
+                    "the create-success document must render the new account's "
+                    "money, so the negative is asserted over a document that "
+                    "actually carries the grant it does not announce")
+                landed_hits = _welcome_occurrences(landed)
+                other_hits = {
+                    path: _welcome_occurrences(_request(port, "GET", path)[2])
+                    for path in ("/", f"/?account={OTHER}", f"/?account={NEW}",
+                                 "/?account=does-not-exist")
+                }
+        self.assertEqual(
+            landed_hits, [],
+            "C3.7: the create-success document must carry no 'welcome' copy — the "
+            "welcome is the activity row, not an announcement beside it; found "
+            f"{landed_hits}")
+        self.assertEqual(
+            {path: hits for path, hits in other_hits.items() if hits}, {},
+            "C3.7: no wallet render path may carry 'welcome' copy; these did: "
+            f"{ {path: hits for path, hits in other_hits.items() if hits} }")
+
+    def test_the_no_welcome_row_fires_on_a_grant_announcement(self):
+        """MUTANT: C3.7's defect (a) injected through the component that renders
+        the create form, driven down the real create path.
+
+        The mutant's **premise** is asserted before its effect: the injected copy
+        must actually reach the served document. Without that, an inert mutation —
+        a patch at a seam the page no longer renders, or a form the landed-on
+        document no longer contains — would make the guard's silence read as a
+        pass. This file has already recorded that failure once, on the disclosure
+        mutant, so it is checked here rather than hoped for.
+
+        Both halves of the row above are exercised: the landed-on document and one
+        of the wallet GETs, since the patch lives in a component they all render.
+
+        This patches a **module global** for the duration of one server (the
+        technique obligation 13 uses); it is process-wide while held, so this row
+        is not parallelizable.
+        """
+        with _running_api() as (_, base):
+            self._fund(base)
+            with mock.patch.object(app_web, "create_form",
+                                   _create_form_with_welcome_copy):
+                with _ui(self.store_path, base) as port:
+                    status, headers, _ = _request(
+                        port, "POST", "/create",
+                        {"owner_id": "t14-owner", "currency": "USD",
+                         "account_id": NEW})
+                    self.assertEqual(status, 303,
+                                     f"POST /create must answer 303; got {status}")
+                    _, _, landed = _request(port, "GET", headers.get("Location") or "")
+                    self.assertIn(
+                        _WELCOME_COPY, landed,
+                        "the mutation must actually be in force, or the guard "
+                        "reporting nothing would read as a pass")
+                    landed_hits = _welcome_occurrences(landed)
+                    root_hits = _welcome_occurrences(_request(port, "GET", "/")[2])
+        self.assertNotEqual(
+            landed_hits, [],
+            "a create-success document carrying the announcement C3.7 rules out "
+            "must be reported by the predicate the row above uses; it found nothing")
+        self.assertNotEqual(
+            root_hits, [],
+            "a wallet GET rendering the same announcement must be reported too; the "
+            "predicate found nothing, so that half of the row above is toothless")
+
+    # -- 1c. a taken *address* is refused by naming the address ---------------
+
+    def _land_a_derived_address(self, port):
+        """Create with a blank address and read back the address that landed.
+
+        The id is read from the **landed page's own active-account element**, not
+        re-derived here: re-deriving would make this fixture agree with a moved
+        ``_derive_account_id`` by construction, and the row is about what the
+        server created, not about what the test can compute.
+        """
+        status, headers, body = _request(
+            port, "POST", "/create",
+            {"owner_id": "Grace Hopper", "currency": "USD", "account_id": ""})
+        self.assertEqual(
+            status, 303,
+            f"a create with a blank address must answer 303; got {status} with "
+            f"body {body[:160]!r}")
+        location = headers.get("Location") or ""
+        landed, _, page = _request(port, "GET", location)
+        self.assertEqual(landed, 200,
+                         f"the 303 target must be a GET answering 200; got {landed}")
+        derived = _active_account(page)
+        self.assertTrue(derived, f"the landed page must name the account; got {location!r}")
+        return derived
+
+    def _collide_on_that_address(self, port):
+        """A **different** name that derives the **same** address, blank address.
+
+        ``"Grace  Hopper"`` is a second space: the name is free, the address it
+        derives is not. This is the branch whose refusal has to name the address,
+        and the reason it does — a sentence about the *name* would be describing
+        something that is not taken.
+        """
+        return _request(port, "POST", "/create",
+                        {"owner_id": "Grace  Hopper", "currency": "USD",
+                         "account_id": ""})
+
+    def test_a_taken_address_is_refused_by_naming_the_address(self):
+        """#28. Two names, one derived address: the refusal must name the address.
+
+        The composition, all three links read rather than assumed:
+
+          * the redirect carries the address in its **own** parameter, so the
+            refusal's subject survives the round trip;
+          * the address it carries is the one the server actually created — read
+            from the first create's landed page, so a derivation that moved
+            cannot make this row pass by agreeing with itself;
+          * the create card's banner, and not some other element of the page,
+            renders it.
+
+        Nothing here asserts a *sentence*. The copy is the owner's to change; the
+        identity is the contract, so the row would survive a rewrite and still
+        fail a refusal that named the wrong thing or named nothing.
+        """
+        with _running_api() as (_, base):
+            self._fund(base)
+            with _ui(self.store_path, base) as port:
+                derived = self._land_a_derived_address(port)
+                status, headers, body = self._collide_on_that_address(port)
+                self.assertEqual(
+                    status, 303,
+                    f"the colliding create must be refused into a GET, not "
+                    f"rendered on the POST; got {status} with body {body[:160]!r}")
+                location = headers.get("Location") or ""
+                query = urllib.parse.parse_qs(urlsplit(location).query,
+                                              keep_blank_values=True)
+                self.assertEqual(query.get("error"), ["name_taken"],
+                                 f"a blank-address collision is the address refusal; "
+                                 f"got {location!r}")
+                self.assertEqual(
+                    query.get("taken_id"), [derived],
+                    f"the refusal's subject must travel in its own parameter and "
+                    f"be the address that collided ({derived!r}); got {location!r}")
+                self.assertEqual(
+                    query.get("new_id"), [""],
+                    "the address input was left blank, so the echo must leave it "
+                    "blank: filling it from the derived address would turn a "
+                    "resubmit into an explicit-id create and answer with the "
+                    "account_exists sibling instead, so this branch would stop "
+                    "being exercised by the control that reached it")
+                landed, _, page = _request(port, "GET", location)
+
+        self.assertEqual(landed, 200, f"the refusal must land on a GET answering 200")
+        self.assertEqual(_refusal_problems(page, derived), [],
+                         "the create card's refusal must name the address that "
+                         "collided; " + "; ".join(_refusal_problems(page, derived)))
+
+    def test_an_explicitly_taken_address_still_gets_the_account_refusal(self):
+        """The sibling branch, so the row above cannot pass by flattening both.
+
+        A *typed* taken address is a different refusal with a different subject:
+        nothing was derived, so nothing about a name is true. Pinning it here is
+        what makes the row above discriminating — a mutant that answered every
+        ``account_exists`` with the address sentence would satisfy that row and
+        red this one.
+        """
+        with _running_api() as (_, base):
+            self._fund(base)
+            with _ui(self.store_path, base) as port:
+                status, headers, body = _request(
+                    port, "POST", "/create",
+                    {"owner_id": "t14-owner", "currency": "USD",
+                     "account_id": BOOT})
+                self.assertEqual(status, 303, f"POST /create must answer 303; got {status}")
+                location = headers.get("Location") or ""
+                self.assertIn("error=account_exists", location,
+                              f"an explicitly taken id is the account refusal; "
+                              f"got {location!r}")
+                self.assertNotIn("taken_id", location,
+                                 f"nothing was derived, so there is no address to "
+                                 f"name; got {location!r}")
+                landed, _, page = _request(port, "GET", location)
+
+        self.assertEqual(landed, 200, "the refusal must land on a GET answering 200")
+        message = _create_card_error(page)
+        self.assertEqual(message, app_web._ERROR_MESSAGES["account_exists"],
+                         "the explicit-id refusal keeps its own copy, in the same "
+                         "create card")
+
+    def test_the_taken_address_row_goes_red_without_the_address(self):
+        """FALSIFIER: the pre-fix rendering, restored, reds the row above.
+
+        The window for showing this row red on the *landed-then* bytes closed
+        before it could be written — ``app/web.py a7d234d4`` landed at 09:50:45
+        with the address already carried — so the red is delivered the durable
+        way instead: an in-gate mutant that puts the pre-fix rendering back
+        (``_PRE_FIX_NAME_TAKEN_COPY``, no placeholder, no lookup) and leaves
+        every other line of the landed code in place.
+
+        The mutant's **premise** is asserted before its effect, twice over,
+        because two different things could make this red for the wrong reason:
+
+          * the patch must be the object the render site reads, and must carry no
+            ``{address}`` for ``str.format`` to fill in — otherwise the mutant
+            would be inert (patching a name nobody looks up) or would inject the
+            address itself and measure nothing;
+          * the mutant must still reach the branch and render a banner. If the
+            card came back with no banner at all, the row would go red on a
+            broken page, and the failure would be attributable to nothing.
+        """
+        with mock.patch.object(app_web, "_NAME_TAKEN_TEMPLATE",
+                               _PRE_FIX_NAME_TAKEN_COPY):
+            self.assertIs(app_web._NAME_TAKEN_TEMPLATE, _PRE_FIX_NAME_TAKEN_COPY,
+                          "the mutant must be the object the render site reads")
+            self.assertNotIn("{address}", app_web._NAME_TAKEN_TEMPLATE,
+                             "the pre-fix copy had no address to format in; a "
+                             "placeholder here would let the mutant inject one")
+            with _running_api() as (_, base):
+                self._fund(base)
+                with _ui(self.store_path, base) as port:
+                    derived = self._land_a_derived_address(port)
+                    _, headers, _ = self._collide_on_that_address(port)
+                    location = headers.get("Location") or ""
+                    _, _, page = _request(port, "GET", location)
+
+            self.assertIn("error=name_taken", location,
+                          "the mutant must still reach the address refusal, or the "
+                          "premise below is untested")
+            message = _create_card_error(page)
+            self.assertEqual(
+                message, _PRE_FIX_NAME_TAKEN_COPY,
+                "the mutant must render its banner in the create card; a card with "
+                "no banner reds the row above for a reason that is not the address")
+            self.assertNotIn(derived, message,
+                             "the mutant's premise: the pre-fix copy names no address")
+            problems = _refusal_problems(page, derived)
+            self.assertEqual(
+                len(problems), 1,
+                f"the row above, run as written against the pre-fix rendering, must "
+                f"report exactly one problem; got {problems!r}")
+            self.assertIn("does not name the address", problems[0],
+                          f"and the problem must be the missing address; got {problems!r}")
 
     # -- 2. switching is presentational ---------------------------------------
 
@@ -1014,6 +1543,145 @@ class AccountsAndSwitching(unittest.TestCase):
                              "an unrouted POST must not touch the pending store")
             self.assertEqual([rec.key for rec in self._records()], [seeded.key],
                              "an unrouted POST must mint no idempotency key")
+
+
+class AccountIdsAreOpaqueInAPath(unittest.TestCase):
+    """#27. Every id the API accepted must be addressable by the id it accepted.
+
+    Real HTTP against a real server, and the ids are created *through* the API,
+    so the row is about the contract the API already made rather than about a
+    string this file chose. Two accounts are created that are each other's trap:
+    the client's two interpolating methods are both exercised, because a single
+    unquoted site is enough to serve the wrong account and a row that only
+    checked one would leave the other unpinned.
+    """
+
+    def _lookalikes(self, base):
+        """Fixture: the two lookalikes, each funded from its own account."""
+        client = ApiClient(base)
+        client.create_account(owner_id="alice", currency="USD", account_id=_PLAIN_ID)
+        client.create_account(owner_id="mallory", currency="USD", account_id=_ENCODED_ID)
+        for funder, account_id, amount, key in (
+                (_FUNDER_A, _PLAIN_ID, _PLAIN_AMOUNT, "t41-plain"),
+                (_FUNDER_B, _ENCODED_ID, _ENCODED_AMOUNT, "t41-encoded")):
+            client.create_account(owner_id=funder, currency="USD",
+                                  allow_overdraft=True, account_id=funder)
+            client.send_transfer(idempotency_key=key, from_account_id=funder,
+                                 to_account_id=account_id, amount_minor=amount,
+                                 currency="USD")
+        return client
+
+    def _read(self, client, method, account_id):
+        """A client read, with a transport failure reported as what it means.
+
+        A dead request and a wrong answer are different defects, and letting the
+        raw ``InvalidURL`` escape would report this row as an *error*, which
+        reads like a broken fixture rather than a broken contract.
+        """
+        try:
+            return getattr(client, method)(account_id)
+        except Exception as exc:
+            raise AssertionError(
+                f"{method}({account_id!r}) must answer: the API accepted this id, "
+                f"so it is a legal account id and has to survive becoming a URL "
+                f"path segment. The request never completed instead "
+                f"({type(exc).__name__}: {exc}).") from exc
+
+    def test_every_id_the_api_accepted_reads_back_as_its_own_account(self):
+        with _running_api() as (_, base):
+            client = self._lookalikes(base)
+            for account_id, owner, funder, amount, other in _LOOKALIKES:
+                with self.subTest(account_id=account_id):
+                    read = self._read(client, "get_balance", account_id)
+                    self.assertEqual(
+                        _ownership_problems(read, account_id, owner), [],
+                        f"GET the balance of {account_id!r} answered for another "
+                        f"account: the id was not carried through the path as the "
+                        f"id it is")
+                    activity = self._read(client, "list_activity", account_id)
+                    self.assertEqual(
+                        _activity_problems(activity, funder, amount, other), [],
+                        f"the activity of {account_id!r} is not its own")
+
+    def test_the_read_row_fires_when_the_balance_site_goes_unquoted(self):
+        """FALSIFIER (one site): the pre-fix ``get_balance``, red on the row above.
+
+        The mutant's **premise** is asserted as the retarget itself — an answer
+        came back, with a 200, for the *other* account — and not as "the read
+        raised". That distinction is the whole finding: a mutant that produced
+        only ``InvalidURL`` would leave the wrong account unread and still make
+        the row above go red, so a falsifier that stops at "it went red" would
+        certify a fix that had not closed the leak.
+
+        The sibling site is asserted still quoted under the same mutant, which is
+        what makes the attribution exact: one site reverted, one row red.
+        """
+        mutant = _unquoted("get_balance")
+        with mock.patch.object(app_client.ApiClient, "get_balance", mutant):
+            self.assertIs(app_client.ApiClient.get_balance, mutant,
+                          "the mutant must be the attribute the row's client reads")
+            with _running_api() as (_, base):
+                client = self._lookalikes(base)
+                read = client.get_balance(_ENCODED_ID)
+                self.assertEqual(
+                    read.get("account_id"), _PLAIN_ID,
+                    f"the mutant's premise: with ``quote`` reverted at this site, "
+                    f"a read for {_ENCODED_ID!r} silently answers for "
+                    f"{_PLAIN_ID!r} with a 200; got {read!r}")
+                problems = _ownership_problems(read, _ENCODED_ID, "mallory")
+                self.assertEqual(
+                    _activity_problems(client.list_activity(_ENCODED_ID),
+                                       _FUNDER_B, _ENCODED_AMOUNT,
+                                       _FUNDER_A), [],
+                    "reverting one site must leave the other quoting; if both "
+                    "went unquoted this mutant proves nothing about either")
+        self.assertNotEqual(
+            problems, [],
+            "the row above, run as written against the pre-fix balance site, must "
+            "go red; it reported no problem")
+        self.assertTrue(
+            any("alice" in problem for problem in problems),
+            f"and the problem must name the account it answered for, so the red is "
+            f"the retarget and not some other breakage; got {problems!r}")
+
+    def test_the_read_row_fires_when_the_activity_site_goes_unquoted(self):
+        """FALSIFIER (the other site): the pre-fix ``list_activity``.
+
+        Same shape and same premise — a silent retarget, read off the
+        counterparty — because the second site is the one a row that only drove
+        ``get_balance`` would have left unpinned.
+        """
+        mutant = _unquoted("list_activity")
+        with mock.patch.object(app_client.ApiClient, "list_activity", mutant):
+            self.assertIs(app_client.ApiClient.list_activity, mutant,
+                          "the mutant must be the attribute the row's client reads")
+            with _running_api() as (_, base):
+                client = self._lookalikes(base)
+                answer = client.list_activity(_ENCODED_ID)
+                pairs = [(item.get("counterparty_owner_id"), item.get("amount_minor"))
+                         for item in answer.get("items", [])]
+                self.assertIn(
+                    (_FUNDER_A, _PLAIN_AMOUNT), pairs,
+                    "the mutant's premise: with ``quote`` reverted at this site, "
+                    "the activity read for the encoded id silently answers with "
+                    f"the plain id's funding row; got {pairs!r}")
+                self.assertNotIn(
+                    (_FUNDER_B, _ENCODED_AMOUNT), pairs,
+                    f"and its own row is nowhere in the answer; got {pairs!r}")
+                problems = _activity_problems(answer, _FUNDER_B, _ENCODED_AMOUNT,
+                                              _FUNDER_A)
+                self.assertEqual(
+                    _ownership_problems(client.get_balance(_ENCODED_ID),
+                                        _ENCODED_ID, "mallory"), [],
+                    "reverting one site must leave the other quoting")
+        self.assertNotEqual(
+            problems, [],
+            "the row above, run as written against the pre-fix activity site, must "
+            "go red; it reported no problem")
+        self.assertTrue(
+            any(_FUNDER_A in problem for problem in problems),
+            f"and the problem must name the account it answered for, so the red is "
+            f"the retarget and not some other breakage; got {problems!r}")
 
 
 if __name__ == "__main__":
