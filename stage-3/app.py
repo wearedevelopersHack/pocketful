@@ -24,6 +24,12 @@ def parse_body():
 def canon(data):
     return json.dumps(data, sort_keys=True, separators=(",", ":"))
 
+def normalize_idempotency_value(value):
+    if isinstance(value, dict) and isinstance(value.get("sig"), list):
+        value = dict(value)
+        value["sig"] = tuple(value["sig"])
+    return value
+
 def as_amount(value, minimum=1):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or int(value) != value:
         raise ValueError
@@ -243,7 +249,7 @@ def import_state():
         state.__dict__.update(copy.deepcopy(data["state"]))
         state.settlement_operator_ids = set(state.settlement_operator_ids)
         if isinstance(state.idempotency, list):
-            state.idempotency = {tuple(row["key"]): row["value"] for row in state.idempotency}
+            state.idempotency = {tuple(row["key"]): normalize_idempotency_value(row["value"]) for row in state.idempotency}
         globals()["S"] = state
     return "", 204
 
@@ -442,11 +448,12 @@ def cancel_request(rid):
     return request_transition(rid, "requester_id", "cancelled")
 
 def page_args():
-    try:
-        limit = int(request.args.get("limit", "50"))
-        offset = int(request.args.get("offset", "0"))
-    except Exception:
+    limit_text = request.args.get("limit", "50")
+    offset_text = request.args.get("offset", "0")
+    if not limit_text.isdecimal() or not offset_text.isdecimal():
         raise ValueError
+    limit = int(limit_text)
+    offset = int(offset_text)
     if limit < 1 or limit > 200 or offset < 0:
         raise ValueError
     return limit, offset
