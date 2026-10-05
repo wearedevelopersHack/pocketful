@@ -119,6 +119,140 @@ class State:
         self.next_ids[prefix] += 1
         return f"{prefix}_{value}"
 
+    @classmethod
+    def from_export(cls, raw):
+        if not isinstance(raw, dict):
+            raise ValueError
+        raw = copy.deepcopy(raw)
+        if "authorizations" not in raw:
+            raw["authorizations"] = {}
+        if "authorization_ttl_seconds" not in raw:
+            raw["authorization_ttl_seconds"] = 600
+        if isinstance(raw.get("next_ids"), dict) and "a" not in raw["next_ids"]:
+            raw["next_ids"]["a"] = 1
+        required = {
+            "currency", "minor_units", "users", "email_to_user", "handle_to_user",
+            "tokens", "payments", "requests", "authorizations",
+            "authorization_ttl_seconds", "idempotency", "settlement_operator_ids",
+            "next_ids",
+        }
+        if set(raw) != required:
+            raise ValueError
+        if not isinstance(raw["currency"], str) or raw["minor_units"] not in (0, 2, 3):
+            raise ValueError
+        for name in ("users", "email_to_user", "handle_to_user", "tokens", "payments", "requests", "authorizations", "next_ids"):
+            if not isinstance(raw[name], dict):
+                raise ValueError
+        if not isinstance(raw["settlement_operator_ids"], list) or not isinstance(raw["idempotency"], list):
+            raise ValueError
+        if not isinstance(raw["authorization_ttl_seconds"], int) or raw["authorization_ttl_seconds"] < 1:
+            raise ValueError
+        if set(raw["next_ids"]) != {"u", "p", "rq", "sp", "st", "a"}:
+            raise ValueError
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in raw["next_ids"].values()):
+            raise ValueError
+
+        users = copy.deepcopy(raw["users"])
+        email_to_user = copy.deepcopy(raw["email_to_user"])
+        handle_to_user = copy.deepcopy(raw["handle_to_user"])
+        tokens = copy.deepcopy(raw["tokens"])
+        payments = copy.deepcopy(raw["payments"])
+        requests = copy.deepcopy(raw["requests"])
+        authorizations = copy.deepcopy(raw["authorizations"])
+
+        for uid, user in users.items():
+            if not isinstance(uid, str) or not isinstance(user, dict) or user.get("id") != uid:
+                raise ValueError
+            for field in ("id", "email", "display_name", "handle", "password_hash"):
+                if not isinstance(user.get(field), str):
+                    raise ValueError
+            user["balance"] = as_amount(user.get("balance"), minimum=0)
+            if email_to_user.get(user["email"]) != uid or handle_to_user.get(user["handle"]) != uid:
+                raise ValueError
+        if set(email_to_user.values()) - set(users) or set(handle_to_user.values()) - set(users):
+            raise ValueError
+        if any(not isinstance(t, str) or uid not in users for t, uid in tokens.items()):
+            raise ValueError
+        if any(not isinstance(uid, str) or uid not in users for uid in raw["settlement_operator_ids"]):
+            raise ValueError
+
+        for pid, payment in payments.items():
+            if not isinstance(pid, str) or not isinstance(payment, dict) or payment.get("id") != pid:
+                raise ValueError
+            if payment.get("from_user_id") not in users or payment.get("to_user_id") not in users:
+                raise ValueError
+            payment["amount"] = as_amount(payment.get("amount"))
+            note = payment.get("note", "")
+            visibility = payment.get("visibility", "public")
+            if not valid_note(note) or visibility not in ("public", "private") or not isinstance(payment.get("created_at"), str):
+                raise ValueError
+
+        for rid, row in requests.items():
+            if not isinstance(rid, str) or not isinstance(row, dict) or row.get("id") != rid:
+                raise ValueError
+            if row.get("requester_id") not in users or row.get("payer_id") not in users:
+                raise ValueError
+            row["amount"] = as_amount(row.get("amount"), minimum=0)
+            if not valid_note(row.get("note", "")) or row.get("status") not in ("pending", "paid", "declined", "cancelled"):
+                raise ValueError
+            if not isinstance(row.get("created_at"), str):
+                raise ValueError
+            if row.get("payment_id") is not None and row["payment_id"] not in payments:
+                raise ValueError
+
+        for aid, row in authorizations.items():
+            if not isinstance(aid, str) or not isinstance(row, dict) or row.get("id") != aid:
+                raise ValueError
+            if row.get("from_user_id") not in users or row.get("to_user_id") not in users or row.get("from_user_id") == row.get("to_user_id"):
+                raise ValueError
+            row["amount"] = as_amount(row.get("amount"))
+            row["captured_amount"] = as_amount(row.get("captured_amount", 0), minimum=0)
+            if row["captured_amount"] > row["amount"]:
+                raise ValueError
+            if row.get("status") not in ("open", "captured", "voided", "expired"):
+                raise ValueError
+            if not isinstance(row.get("expires_at"), str) or not isinstance(row.get("created_at"), str):
+                raise ValueError
+            if not valid_note(row.get("note", "")) or row.get("visibility") not in ("public", "private"):
+                raise ValueError
+            if row.get("payment_id") is not None and row["payment_id"] not in payments:
+                raise ValueError
+            if not isinstance(row.get("payment_ids", []), list):
+                raise ValueError
+            if any(not isinstance(pid, str) or pid not in payments for pid in row.get("payment_ids", [])):
+                raise ValueError
+
+        idempotency = {}
+        for row in raw["idempotency"]:
+            if not isinstance(row, dict) or set(row) != {"key", "value"}:
+                raise ValueError
+            key = row["key"]
+            value = normalize_idempotency_value(row["value"])
+            if not isinstance(key, list) or len(key) != 4 or not all(isinstance(x, str) for x in key):
+                raise ValueError
+            if key[0] not in users or not isinstance(value, dict) or not isinstance(value.get("sig"), (tuple, list)) or "response" not in value:
+                raise ValueError
+            idempotency[tuple(key)] = value
+
+        state = cls()
+        state.currency = raw["currency"]
+        state.minor_units = raw["minor_units"]
+        state.users = users
+        state.email_to_user = email_to_user
+        state.handle_to_user = handle_to_user
+        state.tokens = tokens
+        state.payments = payments
+        state.requests = requests
+        state.authorizations = authorizations
+        state.authorization_ttl_seconds = raw["authorization_ttl_seconds"]
+        state.idempotency = idempotency
+        state.settlement_operator_ids = set(raw["settlement_operator_ids"])
+        state.next_ids = copy.deepcopy(raw["next_ids"])
+        for user in state.users.values():
+            if state.held(user["id"]) > user["balance"]:
+                raise ValueError
+        return state
+
 S = State()
 
 def current_user():
@@ -245,11 +379,10 @@ def import_state():
     if data.get("track") != "pocketful" or data.get("format_version") != 1 or not isinstance(data.get("state"), dict):
         return error(422, "validation_failed")
     with lock:
-        state = State()
-        state.__dict__.update(copy.deepcopy(data["state"]))
-        state.settlement_operator_ids = set(state.settlement_operator_ids)
-        if isinstance(state.idempotency, list):
-            state.idempotency = {tuple(row["key"]): normalize_idempotency_value(row["value"]) for row in state.idempotency}
+        try:
+            state = State.from_export(data["state"])
+        except Exception:
+            return error(422, "validation_failed")
         globals()["S"] = state
     return "", 204
 
