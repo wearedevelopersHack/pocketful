@@ -55,6 +55,7 @@ class State:
         self.payments = {}
         self.requests = {}
         self.authorizations = {}
+        self.statement_snapshots = {}
         self.authorization_ttl_seconds = int(fixture.get("authorization_ttl_seconds", 600) or 600)
         self.idempotency = {}
         self.settlement_operator_ids = set(fixture.get("settlement_operator_ids", []) or [])
@@ -249,6 +250,7 @@ def import_state():
         state = State()
         state.__dict__.update(copy.deepcopy(data["state"]))
         state.settlement_operator_ids = set(state.settlement_operator_ids)
+        state.__dict__.setdefault("statement_snapshots", {})
         if isinstance(state.idempotency, list):
             state.idempotency = {tuple(row["key"]): normalize_idempotency_value(row["value"]) for row in state.idempotency}
         globals()["S"] = state
@@ -700,8 +702,12 @@ def list_authorizations():
     shaped = [auth_json(a) for a in rows]
     if status:
         shaped = [a for a in shaped if a["status"] == status]
+    try:
+        limit, offset = page_args()
+    except ValueError:
+        return error(422, "validation_failed")
     shaped.sort(key=lambda a: a["created_at"], reverse=True)
-    return jsonify(authorizations=shaped, has_more=False)
+    return jsonify(authorizations=shaped[offset:offset + limit], has_more=offset + limit < len(shaped))
 
 @app.post("/authorizations/<aid>/capture")
 def capture_authorization(aid):
@@ -788,6 +794,17 @@ def ensure_revisions(payment):
         })
     return revisions
 
+def revision_as_known(payment, known_at):
+    revisions = ensure_revisions(payment)
+    known = [r for r in revisions if not known_at or parse_instant(r["recorded_at"]) <= known_at]
+    if not known:
+        return None
+    return sorted(known, key=lambda r: (r["recorded_at"], r["revision"]))[-1]
+
+def payment_delta_for(payment, user_id, revision):
+    amount = revision["amount"]
+    return -amount if payment["from_user_id"] == user_id else amount
+
 @app.get("/payments/<pid>/revisions")
 def payment_revisions(pid):
     user, problem = require_user()
@@ -857,30 +874,48 @@ def statement():
         limit, offset = page_args()
         from_arg = request.args.get("from")
         to_arg = request.args.get("to")
-        known_at = request.args.get("known_at")
-        if from_arg:
-            parse_instant(from_arg)
-        if to_arg:
-            parse_instant(to_arg)
-        if known_at:
-            parse_instant(known_at)
+        known_at_arg = request.args.get("known_at")
+        snapshot = request.args.get("snapshot")
+        from_time = parse_instant(from_arg) if from_arg else None
+        to_time = parse_instant(to_arg) if to_arg else None
+        known_at = parse_instant(known_at_arg) if known_at_arg else None
+        if from_time and to_time and from_time > to_time:
+            return error(422, "validation_failed")
     except Exception:
         return error(422, "validation_failed")
-    rows = [p for p in S.payments.values() if user["id"] in (p["from_user_id"], p["to_user_id"])]
-    rows.sort(key=lambda p: (ensure_revisions(p)[-1].get("effective_at", p["created_at"]), p["id"]))
-    opening = user["balance"]
-    entries = []
+    if snapshot:
+        saved = getattr(S, "statement_snapshots", {}).get(snapshot)
+        if not saved or saved["user_id"] != user["id"]:
+            return error(404, "not_found")
+        entries = saved["entries"]
+        return jsonify(opening_balance=saved["opening_balance"], entries=entries[offset:offset + limit], closing_balance=saved["closing_balance"], has_more=offset + limit < len(entries), snapshot=snapshot, **({"known_at": saved["known_at"]} if saved.get("known_at") else {}))
+    visible = []
+    current_delta = 0
+    for payment in S.payments.values():
+        if user["id"] not in (payment["from_user_id"], payment["to_user_id"]):
+            continue
+        current_delta += payment_delta_for(payment, user["id"], ensure_revisions(payment)[-1])
+        revision = revision_as_known(payment, known_at)
+        if not revision:
+            continue
+        effective_at = parse_instant(revision["effective_at"])
+        visible.append((payment, revision, effective_at, payment_delta_for(payment, user["id"], revision)))
+    visible.sort(key=lambda row: (row[2], row[0]["id"]))
+    window = [(p, r, e, d) for p, r, e, d in visible if (not from_time or e >= from_time) and (not to_time or e <= to_time)]
+    after_window_delta = sum(d for _p, _r, e, d in visible if from_time and e < from_time)
+    opening = user["balance"] - current_delta + after_window_delta
     running = opening
-    for p in rows:
-        rev = ensure_revisions(p)[-1]
-        amount = rev["amount"]
-        delta = -amount if p["from_user_id"] == user["id"] else amount
+    entries = []
+    for payment, revision, _effective, delta in window:
         running += delta
-        shaped = payment_json({**p, "amount": amount})
-        entries.append({"payment": shaped, "delta": delta, "balance_after": running, "revision": rev["revision"], "effective_at": rev["effective_at"], "recorded_at": rev["recorded_at"]})
-    body = {"opening_balance": opening, "entries": entries[offset:offset + limit], "closing_balance": running, "has_more": offset + limit < len(entries), "snapshot": secrets.token_urlsafe(12)}
-    if known_at:
-        body["known_at"] = known_at
+        shaped = payment_json({**payment, "amount": revision["amount"]})
+        entries.append({"payment": shaped, "delta": delta, "balance_after": running, "revision": revision["revision"], "effective_at": revision["effective_at"], "recorded_at": revision["recorded_at"]})
+    token = secrets.token_urlsafe(12)
+    saved = {"user_id": user["id"], "opening_balance": opening, "closing_balance": running, "entries": copy.deepcopy(entries), "known_at": known_at_arg}
+    S.statement_snapshots[token] = saved
+    body = {"opening_balance": opening, "entries": entries[offset:offset + limit], "closing_balance": running, "has_more": offset + limit < len(entries), "snapshot": token}
+    if known_at_arg:
+        body["known_at"] = known_at_arg
     return jsonify(body)
 
 @app.post("/payments/<pid>/refunds")
