@@ -203,6 +203,7 @@ def make_payment(from_id, to_id, amount, note, visibility, request_id=None, sett
         "visibility": visibility,
         "request_id": request_id,
         "settlement_id": settlement_id,
+        "refund_of": None,
         "created_at": created_at or ts(),
     }
     S.users[from_id]["balance"] -= amount
@@ -893,6 +894,8 @@ def statement():
     except Exception:
         return error(422, "validation_failed")
     if snapshot:
+        if from_arg is not None or to_arg is not None or known_at_arg is not None:
+            return error(422, "validation_failed")
         saved = getattr(S, "statement_snapshots", {}).get(snapshot)
         if not saved or saved["user_id"] != user["id"]:
             return error(404, "not_found")
@@ -910,9 +913,9 @@ def statement():
         effective_at = parse_instant(revision["effective_at"])
         visible.append((payment, revision, effective_at, payment_delta_for(payment, user["id"], revision)))
     visible.sort(key=lambda row: (row[2], row[0]["id"]))
-    window = [(p, r, e, d) for p, r, e, d in visible if (not from_time or e >= from_time) and (not to_time or e <= to_time)]
-    after_window_delta = sum(d for _p, _r, e, d in visible if from_time and e < from_time)
-    opening = user["balance"] - current_delta + after_window_delta
+    window = [(p, r, e, d) for p, r, e, d in visible if (not from_time or e >= from_time) and (not to_time or e < to_time)]
+    ledger_opening = user["balance"] - current_delta
+    opening = ledger_opening + sum(d for _p, _r, e, d in visible if from_time and e < from_time)
     running = opening
     entries = []
     for payment, revision, _effective, delta in window:
