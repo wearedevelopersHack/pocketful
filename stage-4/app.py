@@ -1,5 +1,5 @@
 import copy, json, os, secrets, threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -203,6 +203,7 @@ def make_payment(from_id, to_id, amount, note, visibility, request_id=None, sett
         "visibility": visibility,
         "request_id": request_id,
         "settlement_id": settlement_id,
+        "refund_of": None,
         "created_at": created_at or ts(),
     }
     S.users[from_id]["balance"] -= amount
@@ -533,13 +534,13 @@ def create_split():
 HTML = r'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pocketful</title><style>
 body{margin:0;background:#f6f7f9;color:#17202a;font-family:Arial,sans-serif}.nav{display:flex;gap:12px;align-items:center;background:#fff;border-bottom:1px solid #d9dee7;padding:12px 16px}.wrap{max-width:1040px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:16px;margin-bottom:14px}input,select,button{font:inherit;box-sizing:border-box;width:100%;padding:10px;margin:5px 0}button{background:#087568;color:white;border:0;border-radius:6px}.money{font-size:30px;font-weight:700}.muted{color:#667085}.err{color:#b42318}
 </style></head><body><div id="app"></div><script>
-let token=localStorage.token||'',me=null;const q=s=>document.querySelector(s);function fmt(v){let m=me?.minor_units??2,c=me?.currency||'EUR';return (m?(v/10**m).toFixed(m):String(v))+' '+c}function minor(s){let m=me?.minor_units??2;if(!/^\d+(\.\d+)?$/.test(s))throw Error('bad amount');let [a,b='']=s.split('.');if(b.length>m)throw Error('bad amount');return Number(a)*10**m+Number((b+'0'.repeat(m)).slice(0,m))}function idem(x){return btoa(JSON.stringify(x)).replace(/[^a-z0-9]/gi,'').slice(0,40)||'k'}
+let token=localStorage.token||'',me=null,payDraft={to_handle:'',amount:'',note:'',visibility:'public'},paySig='',payKey='';const q=s=>document.querySelector(s);function fmt(v){let m=me?.minor_units??2,c=me?.currency||'EUR';return (m?(v/10**m).toFixed(m):String(v))+' '+c}function minor(s){let m=me?.minor_units??2;if(!/^\d+(\.\d+)?$/.test(s))throw Error('bad amount');let [a,b='']=s.split('.');if(b.length>m)throw Error('bad amount');return Number(a)*10**m+Number((b+'0'.repeat(m)).slice(0,m))}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function idem(x){return btoa(JSON.stringify(x)).replace(/[^a-z0-9]/gi,'').slice(0,40)||'k'}
 async function api(p,o={}){o.headers={...(o.headers||{}),'Content-Type':'application/json'};if(token)o.headers.Authorization='Bearer '+token;let r=await fetch(p,o);if(r.status==204)return null;let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error?.code||'error');return j}
 async function boot(){if(token)try{me=await api('/me')}catch{token='';localStorage.removeItem('token')}render()}
 function nav(){return `<div class=nav><b>Pocketful</b><a href="/">Wallet</a><a href="/requests">Requests</a><a href="/split">Split</a><a href="/authorizations">Holds</a><span style="flex:1"></span>${me?`<span data-testid=current-user>${me.display_name}</span><span data-testid=current-handle>${me.handle}</span><button data-testid=logout-button onclick="localStorage.removeItem('token');token='';me=null;render()">Logout</button>`:''}</div>`}
-async function home(){let act=await api('/activity').catch(()=>({payments:[]}));return `<div class=grid><section class=card><div class=muted>Available</div><div class=money data-testid=wallet-available data-amount="${me.available}">${fmt(me.available)}</div><div data-testid=wallet-balance data-amount="${me.balance}">${fmt(me.balance)}</div>${me.held?`<div data-testid=wallet-held data-amount="${me.held}">${fmt(me.held)}</div>`:''}<button data-testid=wallet-refresh onclick=boot()>Refresh</button></section><section class=card><h2>Pay</h2><input data-testid=pay-handle><input data-testid=pay-amount><input data-testid=pay-note><select data-testid=pay-visibility><option value=public>public</option><option value=private>private</option></select><button data-testid=pay-submit onclick=pay()>Pay</button><div id=paymsg></div></section><section class=card><h2>Request</h2><input data-testid=request-handle><input data-testid=request-amount><input data-testid=request-note><button data-testid=request-submit onclick=req()>Request</button><div id=reqmsg></div></section><section class=card><h2>Authorize</h2><input data-testid=authorize-handle><input data-testid=authorize-amount><input data-testid=authorize-note><select data-testid=authorize-visibility><option value=public>public</option><option value=private>private</option></select><button data-testid=authorize-submit onclick=authz()>Authorize</button><div id=authmsg></div></section></div>${feed(act.payments)}`}
+async function home(){let act=await api('/activity').catch(()=>({payments:[]}));return `<div class=grid><section class=card><div class=muted>Available</div><div class=money data-testid=wallet-available data-amount="${me.available}">${fmt(me.available)}</div><div data-testid=wallet-balance data-amount="${me.balance}">${fmt(me.balance)}</div>${me.held?`<div data-testid=wallet-held data-amount="${me.held}">${fmt(me.held)}</div>`:''}<button data-testid=wallet-refresh onclick=boot()>Refresh</button></section><section class=card><h2>Pay</h2><input data-testid=pay-handle value="${esc(payDraft.to_handle)}"><input data-testid=pay-amount value="${esc(payDraft.amount)}"><input data-testid=pay-note value="${esc(payDraft.note)}"><select data-testid=pay-visibility><option value=public ${payDraft.visibility=='public'?'selected':''}>public</option><option value=private ${payDraft.visibility=='private'?'selected':''}>private</option></select><button data-testid=pay-submit onclick=pay()>Pay</button><div id=paymsg></div></section><section class=card><h2>Request</h2><input data-testid=request-handle><input data-testid=request-amount><input data-testid=request-note><button data-testid=request-submit onclick=req()>Request</button><div id=reqmsg></div></section><section class=card><h2>Authorize</h2><input data-testid=authorize-handle><input data-testid=authorize-amount><input data-testid=authorize-note><select data-testid=authorize-visibility><option value=public>public</option><option value=private>private</option></select><button data-testid=authorize-submit onclick=authz()>Authorize</button><div id=authmsg></div></section></div>${feed(act.payments)}`}
 function feed(ps){return ps.length?`<div data-testid=activity-list class=card>${ps.map(p=>`<div data-testid="activity-item-${p.payment_id}" data-visibility="${p.visibility}"><span data-testid="activity-amount-${p.payment_id}">${fmt(p.amount)}</span> <span data-testid="activity-parties-${p.payment_id}">${p.from_handle} ${p.to_handle}</span><div data-testid="activity-note-${p.payment_id}">${p.note}</div></div>`).join('')}</div>`:'<div data-testid=empty-activity class=card>No activity</div>'}
-async function pay(){try{let d={to_handle:q('[data-testid=pay-handle]').value,amount:minor(q('[data-testid=pay-amount]').value),note:q('[data-testid=pay-note]').value,visibility:q('[data-testid=pay-visibility]').value};await api('/payments',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});await boot()}catch(e){q('#paymsg').innerHTML=`<div data-testid=pay-error class=err>${e.message}</div>`}}
+async function pay(){try{payDraft={to_handle:q('[data-testid=pay-handle]').value,amount:q('[data-testid=pay-amount]').value,note:q('[data-testid=pay-note]').value,visibility:q('[data-testid=pay-visibility]').value};let d={to_handle:payDraft.to_handle,amount:minor(payDraft.amount),note:payDraft.note,visibility:payDraft.visibility},sig=JSON.stringify(d);if(sig!=paySig){paySig=sig;payKey=idem(d)}await api('/payments',{method:'POST',headers:{'Idempotency-Key':payKey},body:sig});me=await api('/me');render()}catch(e){q('#paymsg').innerHTML=`<div data-testid=pay-error class=err>${e.message}</div>`}}
 async function req(){try{let d={payer_handle:q('[data-testid=request-handle]').value,amount:minor(q('[data-testid=request-amount]').value),note:q('[data-testid=request-note]').value};await api('/requests',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});await boot()}catch(e){q('#reqmsg').innerHTML=`<div data-testid=request-error class=err>${e.message}</div>`}}
 async function authz(){try{let d={to_handle:q('[data-testid=authorize-handle]').value,amount:minor(q('[data-testid=authorize-amount]').value),note:q('[data-testid=authorize-note]').value,visibility:q('[data-testid=authorize-visibility]').value};await api('/authorizations',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});await boot()}catch(e){q('#authmsg').innerHTML=`<div data-testid=authorize-error class=err>${e.message}</div>`}}
 async function reqPage(){let r=await api('/requests').catch(()=>({requests:[]}));let row=x=>`<div data-testid="request-item-${x.request_id}" data-status="${x.status}"><span data-testid="request-amount-${x.request_id}">${fmt(x.amount)}</span>${x.status=='pending'&&x.payer_id==me.user_id?`<button data-testid="request-pay-${x.request_id}" onclick="payReq('${x.request_id}')">Pay</button><button data-testid="request-decline-${x.request_id}" onclick="mutReq('${x.request_id}','decline')">Decline</button>`:''}${x.status=='pending'&&x.requester_id==me.user_id?`<button data-testid="request-cancel-${x.request_id}" onclick="mutReq('${x.request_id}','cancel')">Cancel</button>`:''}</div>`;return `<div id=reqerr></div><section class=card><div data-testid=incoming-list>${r.requests.filter(x=>x.payer_id==me.user_id).map(row).join('')}</div><div data-testid=outgoing-list>${r.requests.filter(x=>x.requester_id==me.user_id).map(row).join('')}</div>${r.requests.length?'':'<div data-testid=empty-requests>No requests</div>'}</section>`}
@@ -549,7 +550,7 @@ async function doSplit(){try{let d={amount:minor(q('[data-testid=split-amount]')
 async function authPage(){let a=await api('/authorizations').catch(()=>({authorizations:[]}));return `<div id=autherr></div><section class=card><div data-testid=authorization-list>${a.authorizations.map(x=>`<div data-testid="authorization-item-${x.authorization_id}" data-status="${x.status}"><span data-testid="authorization-amount-${x.authorization_id}">${fmt(x.amount)}</span>${x.status=='captured'?`<span data-testid="authorization-captured-${x.authorization_id}">${fmt(x.captured_amount)}</span>`:''}<span data-testid="authorization-expires-${x.authorization_id}">${x.expires_at}</span>${x.status=='open'&&x.to_user_id==me.user_id?`<input data-testid="authorization-capture-amount-${x.authorization_id}" value="${(x.remaining_amount/10**me.minor_units).toFixed(me.minor_units)}"><button data-testid="authorization-capture-${x.authorization_id}" onclick="cap('${x.authorization_id}')">Capture</button>`:''}${x.status=='open'&&x.from_user_id==me.user_id?`<button data-testid="authorization-void-${x.authorization_id}" onclick="vvoid('${x.authorization_id}')">Void</button>`:''}</div>`).join('')}</div>${a.authorizations.length?'':'<div data-testid=empty-authorizations>No authorizations</div>'}</section>`}
 async function cap(id){try{let d={amount:minor(q(`[data-testid=authorization-capture-amount-${id}]`).value)};await api('/authorizations/'+id+'/capture',{method:'POST',headers:{'Idempotency-Key':idem(d)+id},body:JSON.stringify(d)});await boot()}catch(e){q('#autherr').innerHTML=`<div data-testid=authorization-error class=err>${e.message}</div>`}}async function vvoid(id){try{await api('/authorizations/'+id+'/void',{method:'POST',body:'{}'});await boot()}catch(e){q('#autherr').innerHTML=`<div data-testid=authorization-error class=err>${e.message}</div>`}}
 function auth(k){return `<section class=card><input data-testid=${k}-email><input data-testid=${k}-password type=password>${k=='signup'?'<input data-testid=signup-display-name>':''}<button data-testid=${k}-submit onclick="doAuth('${k}')">${k}</button><div id=autherr></div></section>`}async function doAuth(k){try{let d={email:q(`[data-testid=${k}-email]`).value,password:q(`[data-testid=${k}-password]`).value};if(k=='signup')d.display_name=q('[data-testid=signup-display-name]').value;let r=await api('/auth/'+k,{method:'POST',body:JSON.stringify(d)});token=r.token;localStorage.token=token;await boot()}catch(e){q('#autherr').innerHTML=`<div data-testid=auth-error class=err>${e.message}</div>`}}
-async function render(){let p=location.pathname,c;if(!me&&p!='/signup')c=auth('login');else if(p=='/signup')c=auth('signup');else if(p=='/requests')c=await reqPage();else if(p=='/split')c=split();else if(p=='/authorizations')c=await authPage();else c=await home();document.getElementById('app').innerHTML=nav()+`<main class=wrap>${c}</main>`;if(p=='/split')preview()}boot();
+async function render(){let p=location.pathname,c;if(p=='/login')c=auth('login');else if(!me&&p!='/signup')c=auth('login');else if(p=='/signup')c=auth('signup');else if(p=='/requests')c=await reqPage();else if(p=='/split')c=split();else if(p=='/authorizations')c=await authPage();else c=await home();document.getElementById('app').innerHTML=nav()+`<main class=wrap>${c}</main>`;if(p=='/split')preview()}boot();
 </script></body></html>'''
 
 @app.get("/")
@@ -782,6 +783,15 @@ def parse_instant(value):
     except Exception:
         raise ValueError
 
+def after_revisions(*revision_sets):
+    recorded = parse_instant(ts())
+    priors = [parse_instant(r["recorded_at"]) for revisions in revision_sets for r in revisions]
+    if priors:
+        latest = max(priors)
+        if recorded <= latest:
+            recorded = latest + timedelta(seconds=1)
+    return recorded.isoformat()
+
 def ensure_revisions(payment):
     revisions = payment.setdefault("revisions", [])
     if not revisions:
@@ -860,7 +870,7 @@ def payment_correction(pid):
         elif delta < 0:
             S.users[payment["to_user_id"]]["balance"] += delta
             S.users[payment["from_user_id"]]["balance"] -= delta
-        revision = {"payment_id": pid, "revision": expected + 1, "amount": amount, "effective_at": data["effective_at"], "recorded_at": ts(), "reason": reason}
+        revision = {"payment_id": pid, "revision": expected + 1, "amount": amount, "effective_at": data["effective_at"], "recorded_at": after_revisions(revisions), "reason": reason}
         revisions.append({k: revision[k] for k in ("revision", "amount", "effective_at", "recorded_at", "reason")})
         save_idempotency(user, key, data, revision)
         return jsonify(revision), 201
@@ -884,6 +894,8 @@ def statement():
     except Exception:
         return error(422, "validation_failed")
     if snapshot:
+        if from_arg is not None or to_arg is not None or known_at_arg is not None:
+            return error(422, "validation_failed")
         saved = getattr(S, "statement_snapshots", {}).get(snapshot)
         if not saved or saved["user_id"] != user["id"]:
             return error(404, "not_found")
@@ -901,9 +913,9 @@ def statement():
         effective_at = parse_instant(revision["effective_at"])
         visible.append((payment, revision, effective_at, payment_delta_for(payment, user["id"], revision)))
     visible.sort(key=lambda row: (row[2], row[0]["id"]))
-    window = [(p, r, e, d) for p, r, e, d in visible if (not from_time or e >= from_time) and (not to_time or e <= to_time)]
-    after_window_delta = sum(d for _p, _r, e, d in visible if from_time and e < from_time)
-    opening = user["balance"] - current_delta + after_window_delta
+    window = [(p, r, e, d) for p, r, e, d in visible if (not from_time or e >= from_time) and (not to_time or e < to_time)]
+    ledger_opening = user["balance"] - current_delta
+    opening = ledger_opening + sum(d for _p, _r, e, d in visible if from_time and e < from_time)
     running = opening
     entries = []
     for payment, revision, _effective, delta in window:
@@ -1017,7 +1029,7 @@ def correction_batch():
             if delta and S.users[debtor]["balance"] - S.held(debtor) < abs(delta):
                 return error(409, "insufficient_funds")
         bid = "cb_" + secrets.token_urlsafe(8)
-        recorded = ts()
+        recorded = after_revisions(*(revisions for _item, _payment, _amount, _expected, revisions in parsed))
         out = []
         for item, payment, amount, expected, revisions in parsed:
             delta = amount - revisions[-1]["amount"]

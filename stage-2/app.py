@@ -119,6 +119,140 @@ class State:
         self.next_ids[prefix] += 1
         return f"{prefix}_{value}"
 
+    @classmethod
+    def from_export(cls, raw):
+        if not isinstance(raw, dict):
+            raise ValueError
+        raw = copy.deepcopy(raw)
+        if "authorizations" not in raw:
+            raw["authorizations"] = {}
+        if "authorization_ttl_seconds" not in raw:
+            raw["authorization_ttl_seconds"] = 600
+        if isinstance(raw.get("next_ids"), dict) and "a" not in raw["next_ids"]:
+            raw["next_ids"]["a"] = 1
+        required = {
+            "currency", "minor_units", "users", "email_to_user", "handle_to_user",
+            "tokens", "payments", "requests", "authorizations",
+            "authorization_ttl_seconds", "idempotency", "settlement_operator_ids",
+            "next_ids",
+        }
+        if set(raw) != required:
+            raise ValueError
+        if not isinstance(raw["currency"], str) or raw["minor_units"] not in (0, 2, 3):
+            raise ValueError
+        for name in ("users", "email_to_user", "handle_to_user", "tokens", "payments", "requests", "authorizations", "next_ids"):
+            if not isinstance(raw[name], dict):
+                raise ValueError
+        if not isinstance(raw["settlement_operator_ids"], list) or not isinstance(raw["idempotency"], list):
+            raise ValueError
+        if not isinstance(raw["authorization_ttl_seconds"], int) or raw["authorization_ttl_seconds"] < 1:
+            raise ValueError
+        if set(raw["next_ids"]) != {"u", "p", "rq", "sp", "st", "a"}:
+            raise ValueError
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in raw["next_ids"].values()):
+            raise ValueError
+
+        users = copy.deepcopy(raw["users"])
+        email_to_user = copy.deepcopy(raw["email_to_user"])
+        handle_to_user = copy.deepcopy(raw["handle_to_user"])
+        tokens = copy.deepcopy(raw["tokens"])
+        payments = copy.deepcopy(raw["payments"])
+        requests = copy.deepcopy(raw["requests"])
+        authorizations = copy.deepcopy(raw["authorizations"])
+
+        for uid, user in users.items():
+            if not isinstance(uid, str) or not isinstance(user, dict) or user.get("id") != uid:
+                raise ValueError
+            for field in ("id", "email", "display_name", "handle", "password_hash"):
+                if not isinstance(user.get(field), str):
+                    raise ValueError
+            user["balance"] = as_amount(user.get("balance"), minimum=0)
+            if email_to_user.get(user["email"]) != uid or handle_to_user.get(user["handle"]) != uid:
+                raise ValueError
+        if set(email_to_user.values()) - set(users) or set(handle_to_user.values()) - set(users):
+            raise ValueError
+        if any(not isinstance(t, str) or uid not in users for t, uid in tokens.items()):
+            raise ValueError
+        if any(not isinstance(uid, str) or uid not in users for uid in raw["settlement_operator_ids"]):
+            raise ValueError
+
+        for pid, payment in payments.items():
+            if not isinstance(pid, str) or not isinstance(payment, dict) or payment.get("id") != pid:
+                raise ValueError
+            if payment.get("from_user_id") not in users or payment.get("to_user_id") not in users:
+                raise ValueError
+            payment["amount"] = as_amount(payment.get("amount"))
+            note = payment.get("note", "")
+            visibility = payment.get("visibility", "public")
+            if not valid_note(note) or visibility not in ("public", "private") or not isinstance(payment.get("created_at"), str):
+                raise ValueError
+
+        for rid, row in requests.items():
+            if not isinstance(rid, str) or not isinstance(row, dict) or row.get("id") != rid:
+                raise ValueError
+            if row.get("requester_id") not in users or row.get("payer_id") not in users:
+                raise ValueError
+            row["amount"] = as_amount(row.get("amount"), minimum=0)
+            if not valid_note(row.get("note", "")) or row.get("status") not in ("pending", "paid", "declined", "cancelled"):
+                raise ValueError
+            if not isinstance(row.get("created_at"), str):
+                raise ValueError
+            if row.get("payment_id") is not None and row["payment_id"] not in payments:
+                raise ValueError
+
+        for aid, row in authorizations.items():
+            if not isinstance(aid, str) or not isinstance(row, dict) or row.get("id") != aid:
+                raise ValueError
+            if row.get("from_user_id") not in users or row.get("to_user_id") not in users or row.get("from_user_id") == row.get("to_user_id"):
+                raise ValueError
+            row["amount"] = as_amount(row.get("amount"))
+            row["captured_amount"] = as_amount(row.get("captured_amount", 0), minimum=0)
+            if row["captured_amount"] > row["amount"]:
+                raise ValueError
+            if row.get("status") not in ("open", "captured", "voided", "expired"):
+                raise ValueError
+            if not isinstance(row.get("expires_at"), str) or not isinstance(row.get("created_at"), str):
+                raise ValueError
+            if not valid_note(row.get("note", "")) or row.get("visibility") not in ("public", "private"):
+                raise ValueError
+            if row.get("payment_id") is not None and row["payment_id"] not in payments:
+                raise ValueError
+            if not isinstance(row.get("payment_ids", []), list):
+                raise ValueError
+            if any(not isinstance(pid, str) or pid not in payments for pid in row.get("payment_ids", [])):
+                raise ValueError
+
+        idempotency = {}
+        for row in raw["idempotency"]:
+            if not isinstance(row, dict) or set(row) != {"key", "value"}:
+                raise ValueError
+            key = row["key"]
+            value = normalize_idempotency_value(row["value"])
+            if not isinstance(key, list) or len(key) != 4 or not all(isinstance(x, str) for x in key):
+                raise ValueError
+            if key[0] not in users or not isinstance(value, dict) or not isinstance(value.get("sig"), (tuple, list)) or "response" not in value:
+                raise ValueError
+            idempotency[tuple(key)] = value
+
+        state = cls()
+        state.currency = raw["currency"]
+        state.minor_units = raw["minor_units"]
+        state.users = users
+        state.email_to_user = email_to_user
+        state.handle_to_user = handle_to_user
+        state.tokens = tokens
+        state.payments = payments
+        state.requests = requests
+        state.authorizations = authorizations
+        state.authorization_ttl_seconds = raw["authorization_ttl_seconds"]
+        state.idempotency = idempotency
+        state.settlement_operator_ids = set(raw["settlement_operator_ids"])
+        state.next_ids = copy.deepcopy(raw["next_ids"])
+        for user in state.users.values():
+            if state.held(user["id"]) > user["balance"]:
+                raise ValueError
+        return state
+
 S = State()
 
 def current_user():
@@ -245,11 +379,10 @@ def import_state():
     if data.get("track") != "pocketful" or data.get("format_version") != 1 or not isinstance(data.get("state"), dict):
         return error(422, "validation_failed")
     with lock:
-        state = State()
-        state.__dict__.update(copy.deepcopy(data["state"]))
-        state.settlement_operator_ids = set(state.settlement_operator_ids)
-        if isinstance(state.idempotency, list):
-            state.idempotency = {tuple(row["key"]): normalize_idempotency_value(row["value"]) for row in state.idempotency}
+        try:
+            state = State.from_export(data["state"])
+        except Exception:
+            return error(422, "validation_failed")
         globals()["S"] = state
     return "", 204
 
@@ -515,13 +648,13 @@ def create_split():
 HTML = r'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pocketful</title><style>
 body{margin:0;background:#f6f7f9;color:#17202a;font-family:Arial,sans-serif}.nav{display:flex;gap:12px;align-items:center;background:#fff;border-bottom:1px solid #d9dee7;padding:12px 16px}.wrap{max-width:1040px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}.card{background:#fff;border:1px solid #d9dee7;border-radius:8px;padding:16px;margin-bottom:14px}input,select,button{font:inherit;box-sizing:border-box;width:100%;padding:10px;margin:5px 0}button{background:#087568;color:white;border:0;border-radius:6px}.money{font-size:30px;font-weight:700}.muted{color:#667085}.err{color:#b42318}
 </style></head><body><div id="app"></div><script>
-let token=localStorage.token||'',me=null,payDraft={to_handle:'',amount:'',note:'',visibility:'public'};const q=s=>document.querySelector(s);function fmt(v){let m=me?.minor_units??2,c=me?.currency||'EUR';return (m?(v/10**m).toFixed(m):String(v))+' '+c}function minor(s){let m=me?.minor_units??2;if(!/^\d+(\.\d+)?$/.test(s))throw Error('bad amount');let [a,b='']=s.split('.');if(b.length>m)throw Error('bad amount');return Number(a)*10**m+Number((b+'0'.repeat(m)).slice(0,m))}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function idem(x){return btoa(JSON.stringify(x)).replace(/[^a-z0-9]/gi,'').slice(0,40)||'k'}
+let token=localStorage.token||'',me=null,payDraft={to_handle:'',amount:'',note:'',visibility:'public'},paySig='',payKey='';const q=s=>document.querySelector(s);function fmt(v){let m=me?.minor_units??2,c=me?.currency||'EUR';return (m?(v/10**m).toFixed(m):String(v))+' '+c}function minor(s){let m=me?.minor_units??2;if(!/^\d+(\.\d+)?$/.test(s))throw Error('bad amount');let [a,b='']=s.split('.');if(b.length>m)throw Error('bad amount');return Number(a)*10**m+Number((b+'0'.repeat(m)).slice(0,m))}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function idem(x){return btoa(JSON.stringify(x)).replace(/[^a-z0-9]/gi,'').slice(0,40)||'k'}
 async function api(p,o={}){o.headers={...(o.headers||{}),'Content-Type':'application/json'};if(token)o.headers.Authorization='Bearer '+token;let r=await fetch(p,o);if(r.status==204)return null;let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error?.code||'error');return j}
 async function boot(){if(token)try{me=await api('/me')}catch{token='';localStorage.removeItem('token')}render()}
 function nav(){return `<div class=nav><b>Pocketful</b><a href="/">Wallet</a><a href="/requests">Requests</a><a href="/split">Split</a><a href="/authorizations">Holds</a><span style="flex:1"></span>${me?`<span data-testid=current-user>${me.display_name}</span><span data-testid=current-handle>${me.handle}</span><button data-testid=logout-button onclick="localStorage.removeItem('token');token='';me=null;render()">Logout</button>`:''}</div>`}
 async function home(){let act=await api('/activity').catch(()=>({payments:[]}));return `<div class=grid><section class=card><div class=muted>Available</div><div class=money data-testid=wallet-available data-amount="${me.available}">${fmt(me.available)}</div><div data-testid=wallet-balance data-amount="${me.balance}">${fmt(me.balance)}</div>${me.held?`<div data-testid=wallet-held data-amount="${me.held}">${fmt(me.held)}</div>`:''}<button data-testid=wallet-refresh onclick=boot()>Refresh</button></section><section class=card><h2>Pay</h2><input data-testid=pay-handle value="${esc(payDraft.to_handle)}"><input data-testid=pay-amount value="${esc(payDraft.amount)}"><input data-testid=pay-note value="${esc(payDraft.note)}"><select data-testid=pay-visibility><option value=public ${payDraft.visibility=='public'?'selected':''}>public</option><option value=private ${payDraft.visibility=='private'?'selected':''}>private</option></select><button data-testid=pay-submit onclick=pay()>Pay</button><div id=paymsg></div></section><section class=card><h2>Request</h2><input data-testid=request-handle><input data-testid=request-amount><input data-testid=request-note><button data-testid=request-submit onclick=req()>Request</button><div id=reqmsg></div></section><section class=card><h2>Authorize</h2><input data-testid=authorize-handle><input data-testid=authorize-amount><input data-testid=authorize-note><select data-testid=authorize-visibility><option value=public>public</option><option value=private>private</option></select><button data-testid=authorize-submit onclick=authz()>Authorize</button><div id=authmsg></div></section></div>${feed(act.payments)}`}
 function feed(ps){return ps.length?`<div data-testid=activity-list class=card>${ps.map(p=>`<div data-testid="activity-item-${p.payment_id}" data-visibility="${p.visibility}"><span data-testid="activity-amount-${p.payment_id}">${fmt(p.amount)}</span> <span data-testid="activity-parties-${p.payment_id}">${p.from_handle} ${p.to_handle}</span><div data-testid="activity-note-${p.payment_id}">${p.note}</div></div>`).join('')}</div>`:'<div data-testid=empty-activity class=card>No activity</div>'}
-async function pay(){try{payDraft={to_handle:q('[data-testid=pay-handle]').value,amount:q('[data-testid=pay-amount]').value,note:q('[data-testid=pay-note]').value,visibility:q('[data-testid=pay-visibility]').value};let d={to_handle:payDraft.to_handle,amount:minor(payDraft.amount),note:payDraft.note,visibility:payDraft.visibility};await api('/payments',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});me=await api('/me');render()}catch(e){q('#paymsg').innerHTML=`<div data-testid=pay-error class=err>${e.message}</div>`}}
+async function pay(){try{payDraft={to_handle:q('[data-testid=pay-handle]').value,amount:q('[data-testid=pay-amount]').value,note:q('[data-testid=pay-note]').value,visibility:q('[data-testid=pay-visibility]').value};let d={to_handle:payDraft.to_handle,amount:minor(payDraft.amount),note:payDraft.note,visibility:payDraft.visibility},sig=JSON.stringify(d);if(sig!=paySig){paySig=sig;payKey=idem(d)}await api('/payments',{method:'POST',headers:{'Idempotency-Key':payKey},body:sig});me=await api('/me');render()}catch(e){q('#paymsg').innerHTML=`<div data-testid=pay-error class=err>${e.message}</div>`}}
 async function req(){try{let d={payer_handle:q('[data-testid=request-handle]').value,amount:minor(q('[data-testid=request-amount]').value),note:q('[data-testid=request-note]').value};await api('/requests',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});await boot()}catch(e){q('#reqmsg').innerHTML=`<div data-testid=request-error class=err>${e.message}</div>`}}
 async function authz(){try{let d={to_handle:q('[data-testid=authorize-handle]').value,amount:minor(q('[data-testid=authorize-amount]').value),note:q('[data-testid=authorize-note]').value,visibility:q('[data-testid=authorize-visibility]').value};await api('/authorizations',{method:'POST',headers:{'Idempotency-Key':idem(d)},body:JSON.stringify(d)});await boot()}catch(e){q('#authmsg').innerHTML=`<div data-testid=authorize-error class=err>${e.message}</div>`}}
 async function reqPage(){let r=await api('/requests').catch(()=>({requests:[]}));let row=x=>`<div data-testid="request-item-${x.request_id}" data-status="${x.status}"><span data-testid="request-amount-${x.request_id}">${fmt(x.amount)}</span>${x.status=='pending'&&x.payer_id==me.user_id?`<button data-testid="request-pay-${x.request_id}" onclick="payReq('${x.request_id}')">Pay</button><button data-testid="request-decline-${x.request_id}" onclick="mutReq('${x.request_id}','decline')">Decline</button>`:''}${x.status=='pending'&&x.requester_id==me.user_id?`<button data-testid="request-cancel-${x.request_id}" onclick="mutReq('${x.request_id}','cancel')">Cancel</button>`:''}</div>`;return `<div id=reqerr></div><section class=card><div data-testid=incoming-list>${r.requests.filter(x=>x.payer_id==me.user_id).map(row).join('')}</div><div data-testid=outgoing-list>${r.requests.filter(x=>x.requester_id==me.user_id).map(row).join('')}</div>${r.requests.length?'':'<div data-testid=empty-requests>No requests</div>'}</section>`}
